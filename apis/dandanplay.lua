@@ -1,6 +1,65 @@
 local msg = require('mp.msg')
 local utils = require("mp.utils")
 
+------------------------------------------------
+-- 并发请求管理器
+------------------------------------------------
+local ConcurrentManager = {
+    active_requests = 0,
+    max_concurrent = 6, -- 最大并发数
+    pending_requests = {},
+    results = {},
+    waiting = false
+}
+
+function ConcurrentManager:new()
+    local o = {
+        active_requests = 0,
+        max_concurrent = 6,
+        pending_requests = {},
+        results = {},
+        final_callback = nil
+    }
+    setmetatable(o, self)
+    self.__index = self
+    return o
+end
+
+function ConcurrentManager:wait_all(callback)
+    self.final_callback = callback
+    self:check_completion()
+end
+
+function ConcurrentManager:check_completion()
+    if self.active_requests == 0 and #self.pending_requests == 0 and self.final_callback then
+        self.final_callback()
+        self.final_callback = nil
+    end
+end
+
+function ConcurrentManager:start_request(key, request_func)
+    if self.active_requests >= self.max_concurrent then
+        table.insert(self.pending_requests, {key = key, func = request_func})
+        return
+    end
+    self:do_request(key, request_func)
+end
+
+function ConcurrentManager:do_request(key, request_func)
+    self.active_requests = self.active_requests + 1
+    request_func(function(result)
+        self.results[key] = result
+        self.active_requests = self.active_requests - 1
+
+        if #self.pending_requests > 0 and self.active_requests < self.max_concurrent then
+            local next_request = table.remove(self.pending_requests, 1)
+            self:do_request(next_request.key, next_request.func)
+        end
+
+        self:check_completion()
+    end)
+end
+
 local function extract_url(url)
     local path = url:match("^https?://[^/]+(/[^%?]*)")
     return path
@@ -18,6 +77,305 @@ local function generateXSignature(url, time, appid, app_accept)
     local base64Hash = Base64.encode(hex_to_bin(hash))
     return base64Hash
 end
+
+-- 并发请求多个API服务器
+function make_concurrent_danmaku_request(servers, endpoint, method, headers, body, callback)
+    local concurrent_manager = ConcurrentManager:new()
+
+    local total_servers = #servers
+
+    if total_servers == 0 then
+        callback(nil)
+        return
+    end
+
+    for i, server in ipairs(servers) do
+        local url = server .. endpoint
+        local args = make_danmaku_request_args(method, url, headers, body)
+
+        if args then
+            concurrent_manager:start_request(i, function(cb)
+                call_cmd_async(args, function(error, json)
+                    local result = {
+                        server = server,
+                        error = error,
+                        data = nil
+                    }
+
+                    if not error and json then
+                        local success, parsed = pcall(utils.parse_json, json)
+                        if success then
+                            result.data = parsed
+                        else
+                            result.error = "JSON解析失败"
+                        end
+                    end
+
+                    cb(result)
+                end)
+            end)
+        else
+            concurrent_manager.results[i] = {
+                server = server,
+                error = "无法生成请求参数",
+                data = nil
+            }
+        end
+    end
+
+    concurrent_manager:wait_all(function()
+        local results = {}
+        for i = 1, total_servers do
+            if concurrent_manager.results[i] then
+                table.insert(results, concurrent_manager.results[i])
+            end
+        end
+
+        concurrent_manager.results = {}
+
+        local is_search_request = endpoint:find("/search/anime") ~= nil
+        local is_match_request = endpoint:find("/match") ~= nil
+        local is_comment_request = endpoint:find("/comment") ~= nil or endpoint:find("/extcomment") ~= nil
+
+        if is_search_request then
+            local merged_result = {
+                server = "merged",
+                error = nil,
+                data = {
+                    animes = {},
+                    success = true,
+                    errorCode = 0,
+                    errorMessage = ""
+                }
+            }
+
+            local total_animes = 0
+            local seen_anime_ids = {}
+
+            for _, result in ipairs(results) do
+                if result.data and result.data.animes then
+                    for _, anime in ipairs(result.data.animes) do
+                        local anime_id = anime.bangumiId or anime.animeId
+
+                        if anime_id and not seen_anime_ids[anime_id] then
+                            table.insert(merged_result.data.animes, anime)
+                            seen_anime_ids[anime_id] = true
+                            total_animes = total_animes + 1
+                        end
+                    end
+                end
+            end
+
+            if total_animes > 0 then
+                callback(merged_result)
+            else
+                select_best_single_result(results, callback, "animes")
+            end
+
+        elseif is_comment_request then
+            local best_result = nil
+            local max_comments = 0
+
+            for _, result in ipairs(results) do
+                if result.data and result.data.comments then
+                    local comment_count = #result.data.comments
+
+                    if comment_count > max_comments then
+                        max_comments = comment_count
+                        best_result = result
+                    end
+                end
+            end
+
+            if best_result then
+                callback(best_result)
+            else
+                callback(nil)
+            end
+
+        elseif is_match_request then
+            local best_result = nil
+
+            for _, result in ipairs(results) do
+                if result.data and result.data.isMatched and result.data.matches and #result.data.matches > 0 then
+                    best_result = result
+                    break
+                end
+            end
+
+            if best_result then
+                callback(best_result)
+            else
+                select_best_single_result(results, callback, "matches")
+            end
+
+        else
+            select_best_single_result(results, callback)
+        end
+    end)
+end
+
+-- 辅助函数：选择最佳单个服务器结果
+function select_best_single_result(results, callback, data_field)
+    local best_result = nil
+
+    for _, result in ipairs(results) do
+        if result.data then
+            local has_data = false
+
+            if data_field then
+                has_data = result.data[data_field] and #result.data[data_field] > 0
+            else
+                has_data = true
+                for k, v in pairs(result.data) do
+                    if type(v) == "table" and #v > 0 then
+                        has_data = true
+                        break
+                    elseif type(v) ~= "table" and v ~= nil then
+                        has_data = true
+                        break
+                    end
+                end
+            end
+
+            if has_data then
+                if not best_result then
+                    best_result = result
+                elseif data_field and result.data[data_field] and best_result.data[data_field] then
+                    if #result.data[data_field] > #best_result.data[data_field] then
+                        best_result = result
+                    end
+                end
+            end
+        end
+    end
+
+    if best_result then
+        callback(best_result)
+    else
+        callback(nil)
+    end
+end
+
+-- 解析服务器字符串
+local function parse_servers(servers_str)
+    local servers = {}
+    for server in servers_str:gmatch("([^,]+)") do
+        server = server:gsub("^%s*(.-)%s*$", "%1")
+        if server ~= "" then
+            table.insert(servers, server)
+        end
+    end
+    return servers
+end
+
+-- 获取API服务器列表
+function get_api_servers()
+    if options.api_servers and options.api_servers ~= "" then
+        return parse_servers(options.api_servers)
+    else
+        return {options.api_server}
+    end
+end
+
+-- 使用并发请求获取弹幕
+function fetch_danmaku_concurrent(episodeId, from_menu)
+    local servers = get_api_servers()
+    local endpoint = "/api/v2/comment/" .. episodeId .. "?withRelated=true&chConvert=0"
+
+    show_message("弹幕加载中...(" .. #servers .. "个服务器)", 30)
+
+    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
+        if result then
+            if result.data and result.data.comments then
+                local url = result.server .. endpoint
+                handle_fetched_danmaku(result.data, url, from_menu)
+            else
+                show_message("弹幕获取失败: 无弹幕数据", 3)
+                msg.error("弹幕获取失败: 无弹幕数据")
+            end
+        else
+            show_message("弹幕获取失败: 所有服务器请求失败", 3)
+            msg.error("弹幕获取失败: 所有服务器请求失败")
+        end
+    end)
+end
+
+-- 并发获取所有相关弹幕
+function fetch_danmaku_all_concurrent(episodeId, from_menu)
+    local servers = get_api_servers()
+    local endpoint = "/api/v2/related/" .. episodeId
+
+    show_message("弹幕加载中...(" .. #servers .. "个服务器)", 30)
+
+    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
+        if not result or not result.data or not result.data.relateds then
+            show_message("无相关弹幕数据", 3)
+            fetch_danmaku_all(episodeId, from_menu)
+            return
+        end
+
+        local relateds = result.data.relateds
+        local filtered_relateds = filter_excluded_platforms(relateds)
+
+        if #filtered_relateds == 0 then
+            local main_url = (result.server or options.api_server) .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
+            handle_main_danmaku(main_url, from_menu)
+            return
+        end
+
+        local concurrent_manager = ConcurrentManager:new()
+        local total_related = #filtered_relateds
+
+        for index, related in ipairs(filtered_relateds) do
+            concurrent_manager:start_request(index, function(cb)
+                local shift = related.shift
+                local base_server = result.server or options.api_server
+                local url = base_server .. "/api/v2/extcomment?url=" .. url_encode(related.url)
+                local args = make_danmaku_request_args("GET", url)
+
+                if args then
+                    call_cmd_async(args, function(error, json)
+                        local comments = {}
+                        if not error and json then
+                            local data = utils.parse_json(json)
+                            if data and data.comments then
+                                for _, comment in ipairs(data.comments) do
+                                    comment.shift = shift
+                                    table.insert(comments, comment)
+                                end
+                            end
+                        end
+                        cb(comments)
+                    end)
+                else
+                    cb({})
+                end
+            end)
+        end
+
+        concurrent_manager:wait_all(function()
+            local related_count = 0
+            for i = 1, total_related do
+                if concurrent_manager.results[i] then
+                    local comments = concurrent_manager.results[i]
+                    if #comments > 0 then
+                        local related = filtered_relateds[i]
+                        save_danmaku_data(comments, related.url, "api_server")
+                        related_count = related_count + 1
+                    end
+                end
+            end
+
+            concurrent_manager.results = {}
+
+            local base_server = result.server or options.api_server
+            local main_url = base_server .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
+            handle_main_danmaku(main_url, from_menu)
+        end)
+    end)
+end
+
 
 -- 写入history.json
 -- 读取episodeId获取danmaku
@@ -40,12 +398,24 @@ function set_episode_id(input, from_menu)
     local episodeId = tonumber(input)
     write_history(episodeId)
     set_danmaku_button()
-    if options.load_more_danmaku and options.api_server:find("api%.dandanplay%.") then
-        fetch_danmaku_all(episodeId, from_menu)
+
+    local use_concurrent = options.api_servers and #options.api_servers > 1
+
+    if options.load_more_danmaku then
+        if use_concurrent then
+            fetch_danmaku_all_concurrent(episodeId, from_menu)
+        else
+            fetch_danmaku_all(episodeId, from_menu)
+        end
     else
-        fetch_danmaku(episodeId, from_menu)
+        if use_concurrent then
+            fetch_danmaku_concurrent(episodeId, from_menu)
+        else
+            fetch_danmaku(episodeId, from_menu)
+        end
     end
 end
+
 
 -- 回退使用额外的弹幕获取方式
 function get_danmaku_fallback(query)
@@ -169,84 +539,187 @@ local function match_episode(animeTitle, bangumiId, episode_num)
     end)
 end
 
-local function match_anime()
-    local animes = {}
-    local anime_type = "tvseries"
-    local type_count = 0
+local function clean_anime_title(title)
+    local patterns = {
+        "%[OVA%]", "%[OAD%]", "%[剧场版%]", "%[Movie%]", "%[電影%]",
+        "%[特別篇%]", "%[Special%]", "%[SP%]",
+        "OVA", "OAD", "剧场版", "Movie", "特別篇", "Special"
+    }
+
+    local cleaned = title
+    for _, pattern in ipairs(patterns) do
+        cleaned = cleaned:gsub(pattern, "")
+    end
+
+    cleaned = cleaned:gsub("%[.-%]", "")
+
+    cleaned = cleaned:gsub("%s+", " ")
+    cleaned = cleaned:gsub("^%s+", ""):gsub("%s+$", "")
+    return url_encode(cleaned)
+end
+
+local function query_tmdb_chinese_title(title, class)
+    -- 确保class是有效的值
+    if class == "tvseries" or class == "ova" then
+        class = "tv"
+    end
+
+    local encoded_title = url_encode(title)
+    local url = string.format("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&language=zh-CN",
+        class, Base64.decode(options.tmdb_api_key), encoded_title)
+
+    local cmd = {
+        "curl",
+        "-s",
+        "-H", "accept: application/json",
+        url
+    }
+
+    if options.proxy ~= "" then
+        table.insert(cmd, '-x')
+        table.insert(cmd, options.proxy)
+    end
+
+    local res = mp.command_native({
+        name = "subprocess",
+        args = cmd,
+        capture_stdout = true,
+        capture_stderr = true,
+    })
+
+    -- 检查curl命令是否执行成功
+    if res.status ~= 0 then
+        msg.error("curl命令执行失败: " .. (res.stderr or "未知错误"))
+        return nil
+    end
+
+    local data = utils.parse_json(res.stdout)
+
+    -- 检查HTTP状态码
+    if data and data.status_code and data.status_code == 34 then
+        msg.error("TMDB资源未找到: " .. title)
+        return nil
+    end
+
+    if not data or not data.results or #data.results == 0 then
+        msg.error("TMDB搜索无结果: " .. title)
+        return nil
+    end
+
+    -- 返回第一个结果的中文标题
+    if class == "tv" then
+        return data.results[1].name
+    else
+        return data.results[1].title
+    end
+end
+
+function match_anime_concurrent()
+    local servers = get_api_servers()
     local title, season_num, episode_num = parse_title()
-    if not episode_num then
-        msg.info("无法解析剧集信息")
-        return
-    end
+    msg.info("=== 标题解析结果 ===")
+    msg.info("原始标题: " .. (title or "nil"))
+    msg.info("季数: " .. (season_num or "nil"))
+    msg.info("集数: " .. (episode_num or "nil"))
+    msg.info("服务器列表: " .. table.concat(servers, ", "))
+    episode_num = episode_num or 1
+    local encoded_query = clean_anime_title(title)
+    local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
 
-    if title:match("OVA") or title:match("OAD") then
-        anime_type = "ova"
-    end
+    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
 
-    local encoded_query = url_encode(title)
-    local url = options.api_server .. "/api/v2/search/anime"
-    local params = "keyword=" .. encoded_query
-    local full_url = url .. "?" .. params
-    local args = make_danmaku_request_args("GET", full_url)
+        if result then
 
-    if not args then return end
+            local animes = result.data and result.data.animes or {}
 
-    call_cmd_async(args, function(error, json)
-        async_running = false
-        if error then
-            show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            msg.error(error)
-            return
-        end
+            if #animes > 0 then
+                -- 原有的匹配逻辑
+                local filtered_animes = {}
+                local anime_type = "tvseries"
+                local type_count = 0
+                local lower_title = title:lower()
 
-        local data = utils.parse_json(json)
-        if not data or not data.animes then
-            msg.info("无结果")
-            return
-        end
-
-        for _, anime in ipairs(data.animes) do
-            if anime.type == anime_type then
-                type_count = type_count + 1
-                table.insert(animes, anime)
-            end
-        end
-
-        if type_count == 1 then
-            match_episode(animes[1].animeTitle, animes[1].bangumiId, episode_num)
-        elseif type_count > 1 and season_num then
-            local best_match, best_score = nil, -1
-            local target_title = title
-            if tonumber(season_num) > 1 then
-                target_title = title .. " 第" .. number_to_chinese(season_num) .. "季"
-            end
-            for _, anime in ipairs(animes) do
-                if anime.animeTitle:match("第一[季部]") and tonumber(season_num) == 1 then
-                    target_title = title .. " 第一季"
+                if lower_title:match("ova") or lower_title:match("oad") then
+                    anime_type = "ova"
+                elseif lower_title:match("剧场版") or lower_title:match("movie") or lower_title:match("劇場版") then
+                    anime_type = "movie"
                 end
-                local score = jaro_winkler(target_title, anime.animeTitle)
-                msg.debug(("候选: %s -> 相似度 %.3f"):format(anime.animeTitle, score))
-                if score > best_score then
-                    best_score = score
-                    best_match = anime
-                end
-            end
 
-            if best_match and best_score >= 0.75 then
-                msg.info(("模糊匹配选中: %s (score=%.2f)"):format(best_match.animeTitle, best_score))
-                match_episode(best_match.animeTitle, best_match.bangumiId, episode_num)
+                local function filter_by_type(animes, t)
+                    local result = {}
+                    for _, a in ipairs(animes) do
+                        if a.type == t then table.insert(result, a) end
+                    end
+                    return result
+                end
+
+                local filtered_animes = filter_by_type(animes, anime_type)
+                -- movie类型作为备选
+                if #filtered_animes == 0 and anime_type == "tvseries" and not season_num then
+                    filtered_animes = filter_by_type(animes, "movie")
+                end
+
+                if #filtered_animes == 1 then
+                    match_episode(filtered_animes[1].animeTitle, filtered_animes[1].bangumiId, episode_num)
+                elseif #filtered_animes > 1 then
+                    -- 改进的模糊匹配逻辑
+                    local best_match, best_score = nil, -1
+                    local base_title = title:gsub("%s*%(%d+%)", ""):gsub("^%s*(.-)%s*$", "%1")
+                    local target_title = base_title
+                    if is_english(base_title) then
+                        local chinese_title = query_tmdb_chinese_title(base_title, anime_type)
+                        if chinese_title then
+                            base_title = chinese_title
+                            msg.info("成功获取中文标题: " .. chinese_title)
+                        else
+                            msg.info("无法获取中文标题，使用原英文标题: " .. base_title)
+                        end
+                    end
+
+                    if tonumber(season_num) > 1 then
+                        target_title = base_title .. " 第" .. number_to_chinese(season_num) .. "季"
+                    else
+                        target_title = base_title .. " 第一季"
+                    end
+
+                    msg.info("   目标匹配标题: " .. target_title)
+
+                    for _, anime in ipairs(filtered_animes) do
+                        local anime_title = anime.animeTitle or ""
+                        local score = jaro_winkler(target_title, anime_title)
+                        local anime_season = extract_season(anime_title)
+                        if tonumber(season_num) > 0 then
+                            if anime_season ~= tonumber(season_num) then
+                                score = score - 0.2
+                            end
+                        end
+                        msg.info("   候选: " .. anime_title .. " -> 相似度 " .. string.format("%.3f", score))
+
+                        if score > best_score then
+                            best_score = score
+                            best_match = anime
+                        end
+                    end
+                    local threshold = 0.75
+                    if best_match and best_score >= threshold then
+                        msg.info("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_score) .. ")")
+                        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num)
+                    end
+                else
+                    msg.info("❌ 没有找到合适的匹配结果")
+                end
             else
-                msg.info("匹配到多个结果，但相似度不足，请手动搜索")
+                msg.info("❌ 搜索无结果")
             end
         else
-            msg.info("没有找到合适的匹配结果")
+            msg.info("❌ 搜索请求失败")
         end
     end)
 end
 
 -- 执行哈希匹配获取弹幕
-local function match_file(file_path, file_name, callback)
-    -- 计算文件哈希
+local function match_file_concurrent(file_path, file_name, callback)
+    local servers = get_api_servers()
     local hash = nil
     local file_info = utils.file_info(file_path)
     if file_info and file_info.size > 16 * 1024 * 1024 then
@@ -265,7 +738,11 @@ local function match_file(file_path, file_name, callback)
         end
     end
 
-    if hash then msg.info('hash:', hash) end
+    if hash then
+        msg.info('hash:', hash)
+    else
+        msg.info("未生成hash，将使用文件名匹配模式")
+    end
 
     local title, season_num, episode_num = parse_title()
     if title and episode_num then
@@ -275,39 +752,26 @@ local function match_file(file_path, file_name, callback)
             file_name = title .. " E" .. episode_num
         end
     else
-        file_name = title
+        file_name = title or file_name
     end
+    local endpoint = "/api/v2/match"
+    local body = {
+        fileName = file_name,
+        fileHash = hash or "",
+        matchMode = hash and "hashAndFileName" or "fileNameOnly"
+    }
 
-    local url = options.api_server .. "/api/v2/match"
-    local args = make_danmaku_request_args("POST", url, {
-            ["Content-Type"] = "application/json"
-        }, {
-            fileName = file_name,
-            fileHash = hash or "a1b2c3d4e5f67890abcd1234ef567890",
-            matchMode = "hashAndFileName"
-        }
-    )
-
-    if not args then return end
-
-    call_cmd_async(args, function(error, json)
-        async_running = false
-        if error then
-            show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            callback(error)
-            return
-        end
-        local data = utils.parse_json(json)
-        if not data or not data.isMatched or #data.matches > 1 then
+    make_concurrent_danmaku_request(servers, endpoint, "POST", {
+        ["Content-Type"] = "application/json"
+    }, body, function(result)
+        if not result or not result.data or not result.data.isMatched or #result.data.matches > 1 then
             callback("没有匹配的剧集")
             return
         end
 
-        DANMAKU.anime = data.matches[1].animeTitle
-        DANMAKU.episode = data.matches[1].episodeTitle
-
-        -- 获取并加载弹幕数据
-        set_episode_id(data.matches[1].episodeId)
+        DANMAKU.anime = result.data.matches[1].animeTitle
+        DANMAKU.episode = result.data.matches[1].episodeTitle
+        set_episode_id(result.data.matches[1].episodeId)
     end)
 end
 
@@ -717,11 +1181,11 @@ function save_danmaku_json(comments, json_filename)
     return false
 end
 
--- 通过文件前 16M 的 hash 值进行弹幕匹配
+-- 修改 get_danmaku_with_hash 函数以使用并发版本
 function get_danmaku_with_hash(file_name, file_path)
     if type(MD5) ~= "table" or not MD5.sum then
         msg.warn("MD5 模块不支持 Lua 5.1，回退到文件名匹配")
-        match_anime()
+        match_anime_concurrent()  -- 使用并发版本
         return
     end
     if is_protocol(file_path) then
@@ -753,11 +1217,10 @@ function get_danmaku_with_hash(file_name, file_path)
 
             file_path = utils.join_path(DANMAKU_PATH, temp_file)
 
-            match_file(file_path, file_name, function(error)
+            match_file_concurrent(file_path, file_name, function(error)  -- 使用并发版本
                 if error then
                     msg.error(error)
-                    msg.info("尝试通过解析文件名获取弹幕")
-                    match_anime()
+                    match_anime_concurrent()  -- 使用并发版本
                 end
             end)
         end)
@@ -770,14 +1233,13 @@ function get_danmaku_with_hash(file_name, file_path)
             end
         end
         if contains_any(excluded_path, dir) then
-            match_anime()
+            match_anime_concurrent()  -- 使用并发版本
             return
         end
-        match_file(file_path, file_name, function(error)
+        match_file_concurrent(file_path, file_name, function(error)  -- 使用并发版本
             if error then
                 msg.error(error)
-                msg.info("尝试通过解析文件名获取弹幕")
-                match_anime()
+                match_anime_concurrent()  -- 使用并发版本
             end
         end)
     end

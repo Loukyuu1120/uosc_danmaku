@@ -1,5 +1,10 @@
 local utils = require("mp.utils")
 
+-- 简单的英文检测：检查是否包含中文字符
+function is_english(text)
+    return not string.match(text, "[\228-\233][\128-\191].")
+end
+
 -- from http://lua-users.org/wiki/LuaUnicode
 local UTF8_PATTERN = '[%z\1-\127\194-\244][\128-\191]*'
 
@@ -364,6 +369,28 @@ function title_replace(title)
             end
         end
     end
+
+    if title and title ~= "" then
+        -- 去重复标题段（前半段 + 后半段重复处理）
+        do
+            local left, right = title:match("^(.*)%s-%-%s-(.*)$")
+            if left and right then
+                left = left:gsub("^%s*(.-)%s*$", "%1")
+                right = right:gsub("^%s*(.-)%s*$", "%1")
+
+                -- 如果右段在左段中出现 → 删除右段
+                if left:find(right, 1, true) then
+                    title = left
+                else
+                    title = left .. " - " .. right
+                end
+            end
+        end
+
+        -- 去多余空格
+        title = title:gsub("%s+", " "):gsub("^%s*(.-)%s*$", "%1")
+    end
+
     return title
 end
 
@@ -505,6 +532,9 @@ function parse_title()
                 return title_replace(media_title), season, episode
             else
                 media_title, episode = title:match("^(.-)%s*[eE](%d+)")
+                if episode and tonumber(episode) and tonumber(episode) >= 720 then
+                    episode = nil
+                end
                 if episode then
                     return title_replace(media_title), season, episode
                 end
@@ -514,17 +544,21 @@ function parse_title()
 
         local directory = get_parent_directory(path)
         local dir, title = utils.split_path(directory:sub(1, -2))
-        if title:lower():match("^%s*seasons?%s*%d+%s*$") or title:lower():match("^%s*specials?%s*$") or title:match("^%s*SPs?%s*$")
-        or title:match("^%s*O[VAD]+s?%s*$") or title:match("^%s*第.-[季部]+%s*$") then
+        if title:lower():match("^%s*seasons?%s*%d+%s*$")
+            or title:lower():match("^%s*specials?%s*$")
+            or title:match("^%s*SPs?%s*$")
+            or title:match("^%s*O[VAD]+s?%s*$")
+            or title:match("^%s*第.-[季部]+%s*$") then
             directory, title = utils.split_path(dir:sub(1, -2))
         end
         title = title
-                :gsub(thin_space, " ")
-                :gsub("%[.-%]", "")
-                :gsub("^%s*%(%d+.?%d*.?%d*%)", "")
-                :gsub("%(%d+.?%d*.?%d*%)%s*$", "")
-                :gsub("[%._]", " ")
-                :gsub("^%s*(.-)%s*$", "%1")
+            :gsub(thin_space, " ")
+            :gsub("%[.-%]", "")
+            :gsub("^%s*%(%d+.?%d*.?%d*%)", "")
+            :gsub("%(%d+.?%d*.?%d*%)%s*$", "")
+            :gsub("[%._]", " ")
+            :gsub("^%s*(.-)%s*$", "%1")
+
         return title_replace(title)
     end
 
@@ -541,6 +575,9 @@ function parse_title()
                 title = media_title
             else
                 media_title, episode = format_title:match("^(.-)%s*[eE](%d+)")
+                if episode and tonumber(episode) and tonumber(episode) >= 720 then
+                    episode = nil
+                end
                 if episode then
                     season = 1
                     title = media_title
@@ -553,6 +590,27 @@ function parse_title()
 
     return title_replace(title), season, episode
 end
+
+function extract_season(title)
+    title = title:match("^%s*(.-)%s*$") or title
+    local s = title:match("第%s*([一二三四五六七八九十]+)%s*季")
+           or title:match("第%s*([一二三四五六七八九十]+)%s*期")
+           or title:match("第%s*(%d+)%s*季")
+           or title:match("第%s*(%d+)%s*期")
+           or title:match("Season%s*(%d+)")
+           or title:match("S%s*(%d+)")
+
+    if s then
+        if tonumber(s) then
+            return tonumber(s)
+        else
+            return chinese_to_number(s)
+        end
+    end
+
+    return 0
+end
+
 
 local CHINESE_NUM_MAP = {
     ["零"] = 0, ["一"] = 1, ["二"] = 2, ["三"] = 3, ["四"] = 4,
@@ -651,6 +709,7 @@ function call_cmd_async(args, callback)
         playback_only = false,
         args = args,
     }, function(success, result, error)
+        async_running = false
         if not success or not result or result.status ~= 0 then
             local exit_code = (result and result.status or 'unknown')
             local message = error or (result and result.stdout .. result.stderr) or ''

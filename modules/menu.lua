@@ -7,82 +7,68 @@ uosc_available = false
 -- 打开番剧数据匹配菜单
 function get_animes(query)
     local encoded_query = url_encode(query)
-    local url = options.api_server .. "/api/v2/search/anime"
-    local params = "keyword=" .. encoded_query
-    local full_url = url .. "?" .. params
+    local servers = get_api_servers()
+    local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
+    
     local items = {}
-
-    local message = "加载数据中..."
+    local message = "加载数据中...(" .. #servers .. "个服务器)"
     local menu_type = "menu_anime"
     local menu_title = "在此处输入番剧名称"
     local footnote = "使用enter或ctrl+enter进行搜索"
     local menu_cmd = { "script-message-to", mp.get_script_name(), "search-anime-event" }
+    
     if uosc_available then
         update_menu_uosc(menu_type, menu_title, message, footnote, menu_cmd, query)
     else
         show_message(message, 30)
     end
-    msg.verbose("尝试获取番剧数据：" .. full_url)
+    msg.verbose("尝试获取番剧数据：" .. endpoint .. " (服务器数量: " .. #servers .. ")")
 
-    local args = make_danmaku_request_args("GET", full_url)
-
-    if args == nil then
-        return
-    end
-
-    local res = mp.command_native({ name = 'subprocess', capture_stdout = true, capture_stderr = true, args = args })
-
-    if not res.status or res.status ~= 0 then
-        local message = "获取数据失败"
-        if uosc_available then
-            update_menu_uosc(menu_type, menu_title, message, footnote, menu_cmd, query)
-        else
-            show_message(message, 3)
+    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
+        if not result or not result.data or not result.data.animes then
+            local message = "无结果"
+            if uosc_available then
+                update_menu_uosc(menu_type, menu_title, message, footnote, menu_cmd, query)
+            else
+                show_message(message, 3)
+            end
+            msg.info("搜索无结果")
+            return
         end
-        msg.error("HTTP 请求失败：" .. res.stderr)
-    end
 
-    local response = utils.parse_json(res.stdout)
+        local response = result.data
+        msg.info("✅ 搜索到 " .. #response.animes .. " 个结果 (服务器: " .. (result.server or "未知") .. ")")
 
-    if not response or not response.animes then
-        local message = "无结果"
-        if uosc_available then
-            update_menu_uosc(menu_type, menu_title, message, footnote, menu_cmd, query)
-        else
-            show_message(message, 3)
+        for _, anime in ipairs(response.animes) do
+            table.insert(items, {
+                title = anime.animeTitle,
+                hint = anime.typeDescription,
+                value = {
+                    "script-message-to",
+                    mp.get_script_name(),
+                    "search-episodes-event",
+                    anime.animeTitle, anime.bangumiId,
+                },
+            })
         end
-        msg.info("无结果")
-        return
-    end
 
-    for _, anime in ipairs(response.animes) do
-        table.insert(items, {
-            title = anime.animeTitle,
-            hint = anime.typeDescription,
-            value = {
-                "script-message-to",
-                mp.get_script_name(),
-                "search-episodes-event",
-                anime.animeTitle, anime.bangumiId,
-            },
-        })
-    end
-
-    if uosc_available then
-        update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
-    elseif input_loaded then
-        show_message("", 0)
-        mp.add_timeout(0.1, function()
-            open_menu_select(items)
-        end)
-    end
+        if uosc_available then
+            update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
+        elseif input_loaded then
+            show_message("", 0)
+            mp.add_timeout(0.1, function()
+                open_menu_select(items)
+            end)
+        end
+    end)
 end
 
 function get_episodes(animeTitle, bangumiId)
-    local url = options.api_server .. "/api/v2/bangumi/" .. bangumiId
+    local servers = get_api_servers()
+    local endpoint = "/api/v2/bangumi/" .. bangumiId
     local items = {}
 
-    local message = "加载数据中..."
+    local message = "加载数据中...(" .. #servers .. "个服务器)"
     local menu_type = "menu_episodes"
     local menu_title = "剧集信息"
     local footnote = "使用 / 打开筛选"
@@ -92,56 +78,42 @@ function get_episodes(animeTitle, bangumiId)
     else
         show_message(message, 30)
     end
+    msg.verbose("获取剧集数据：" .. endpoint .. " (服务器数量: " .. #servers .. ")")
 
-    local args = make_danmaku_request_args("GET", url)
-
-    if args == nil then
-        return
-    end
-
-    local res = mp.command_native({ name = 'subprocess', capture_stdout = true, capture_stderr = true, args = args })
-
-    if not res.status or res.status ~= 0 then
-        local message = "获取数据失败"
-        if uosc_available then
-            update_menu_uosc(menu_type, menu_title, message, footnote)
-        else
-            show_message(message, 3)
+    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
+        if not result or not result.data or not result.data.bangumi or not result.data.bangumi.episodes then
+            local message = "无结果"
+            if uosc_available then
+                update_menu_uosc(menu_type, menu_title, message, footnote)
+            else
+                show_message(message, 3)
+            end
+            msg.info("获取剧集列表失败")
+            return
         end
-        msg.error("HTTP 请求失败：" .. res.stderr)
-    end
 
-    local response = utils.parse_json(res.stdout)
+        local response = result.data
+        msg.info("✅ 获取到 " .. #response.bangumi.episodes .. " 个剧集 (服务器: " .. (result.server or "未知") .. ")")
 
-    if not response or not response.bangumi or not response.bangumi.episodes then
-        local message = "无结果"
-        if uosc_available then
-            update_menu_uosc(menu_type, menu_title, message, footnote)
-        else
-            show_message(message, 3)
+        for _, episode in ipairs(response.bangumi.episodes) do
+            table.insert(items, {
+                title = episode.episodeTitle,
+                hint = episode.episodeNumber,
+                value = { "script-message-to", mp.get_script_name(), "load-danmaku",
+                animeTitle, episode.episodeTitle, episode.episodeId },
+                keep_open = false,
+                selectable = true,
+            })
         end
-        msg.info("无结果")
-        return
-    end
 
-    for _, episode in ipairs(response.bangumi.episodes) do
-        table.insert(items, {
-            title = episode.episodeTitle,
-            hint = episode.episodeNumber,
-            value = { "script-message-to", mp.get_script_name(), "load-danmaku",
-            animeTitle, episode.episodeTitle, episode.episodeId },
-            keep_open = false,
-            selectable = true,
-        })
-    end
-
-    if uosc_available then
-        update_menu_uosc(menu_type, menu_title, items, footnote)
-    elseif input_loaded then
-        mp.add_timeout(0.1, function()
-            open_menu_select(items)
-        end)
-    end
+        if uosc_available then
+            update_menu_uosc(menu_type, menu_title, items, footnote)
+        elseif input_loaded then
+            mp.add_timeout(0.1, function()
+                open_menu_select(items)
+            end)
+        end
+    end)
 end
 
 function update_menu_uosc(menu_type, menu_title, menu_item, menu_footnote, menu_cmd, query)

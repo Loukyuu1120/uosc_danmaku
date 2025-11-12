@@ -1,7 +1,7 @@
 local msg = require('mp.msg')
 local utils = require("mp.utils")
 
-local repo = "Tony15246/uosc_danmaku"
+local repo = "Loukyuu1120/uosc_danmaku"
 local zip_file = utils.join_path(os.getenv("TEMP") or "/tmp/", "uosc_danmaku.zip")
 
 local local_version = VERSION or "0.0.0"

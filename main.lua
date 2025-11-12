@@ -1,4 +1,4 @@
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 mp.commandv('script-message', 'uosc_danmaku-version', VERSION)
 
@@ -903,6 +903,7 @@ end)
 mp.register_script_message("show_danmaku_keyboard", function()
     ENABLED = not ENABLED
     if ENABLED then
+        show_message("开启弹幕", 2)
         mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "on")
         set_danmaku_visibility(true)
         if COMMENTS == nil then
