@@ -9,14 +9,22 @@ function get_animes(query)
     local encoded_query = url_encode(query)
     local servers = get_api_servers()
     local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
-    
+
     local items = {}
     local message = "加载数据中...(" .. #servers .. "个服务器)"
     local menu_type = "menu_anime"
     local menu_title = "在此处输入番剧名称"
     local footnote = "使用enter或ctrl+enter进行搜索"
     local menu_cmd = { "script-message-to", mp.get_script_name(), "search-anime-event" }
-    
+
+    -- 添加返回按钮，保留原始搜索关键词
+    table.insert(items, {
+        title = "← 返回",
+        value = { "script-message-to", mp.get_script_name(), "open_search_danmaku_menu" },
+        keep_open = false,
+        selectable = true,
+    })
+
     if uosc_available then
         update_menu_uosc(menu_type, menu_title, message, footnote, menu_cmd, query)
     else
@@ -24,96 +32,215 @@ function get_animes(query)
     end
     msg.verbose("尝试获取番剧数据：" .. endpoint .. " (服务器数量: " .. #servers .. ")")
 
-    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
-        if not result or not result.data or not result.data.animes then
-            local message = "无结果"
-            if uosc_available then
-                update_menu_uosc(menu_type, menu_title, message, footnote, menu_cmd, query)
-            else
-                show_message(message, 3)
-            end
-            msg.info("搜索无结果")
-            return
-        end
+    -- 使用集合来避免重复
+    local seen_anime_ids = {}
+    local total_results = 0
+    local completed_requests = 0
 
-        local response = result.data
-        msg.info("✅ 搜索到 " .. #response.animes .. " 个结果 (服务器: " .. (result.server or "未知") .. ")")
+    -- 为每个服务器创建独立的请求
+    for i, server in ipairs(servers) do
+        local url = server .. endpoint
+        local args = make_danmaku_request_args("GET", url, nil, nil)
 
-        for _, anime in ipairs(response.animes) do
-            table.insert(items, {
-                title = anime.animeTitle,
-                hint = anime.typeDescription,
-                value = {
-                    "script-message-to",
-                    mp.get_script_name(),
-                    "search-episodes-event",
-                    anime.animeTitle, anime.bangumiId,
-                },
-            })
-        end
+        if args then
+            call_cmd_async(args, function(error, json)
+                completed_requests = completed_requests + 1
 
-        if uosc_available then
-            update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
-        elseif input_loaded then
-            show_message("", 0)
-            mp.add_timeout(0.1, function()
-                open_menu_select(items)
+                local result_data = nil
+                if not error and json then
+                    local success, parsed = pcall(utils.parse_json, json)
+                    if success and parsed and parsed.animes then
+                        result_data = parsed
+                    end
+                end
+
+                -- 处理数据
+                if result_data and result_data.animes then
+                    for _, anime in ipairs(result_data.animes) do
+                        local anime_id = anime.bangumiId or anime.animeId
+                        if anime_id and not seen_anime_ids[anime_id] then
+                            table.insert(items, {
+                                title = anime.animeTitle,
+                                hint = anime.typeDescription,
+                                value = {
+                                    "script-message-to",
+                                    mp.get_script_name(),
+                                    "search-episodes-event",
+                                    anime.animeTitle,
+                                    anime.bangumiId,
+                                    server,  -- 保存服务器信息
+                                    query    -- 保存原始搜索关键词
+                                },
+                            })
+                            seen_anime_ids[anime_id] = true
+                            total_results = total_results + 1
+                        end
+                    end
+                end
+
+                -- 所有请求完成后更新界面
+                if completed_requests == #servers then
+                    if total_results > 0 then
+                        local message = "✅ 搜索到 " .. total_results .. " 个结果"
+
+                        if uosc_available then
+                            update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
+                        elseif input_loaded then
+                            show_message("", 0)
+                            mp.add_timeout(0.1, function()
+                                open_menu_select(items)
+                            end)
+                        end
+                    else
+                        -- 如果没有结果，确保返回按钮仍然显示
+                        if #items == 1 then -- 只有返回按钮
+                            local message = "无结果"
+                            if uosc_available then
+                                update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
+                            else
+                                show_message(message, 3)
+                            end
+                        end
+                    end
+                end
             end)
+        else
+            completed_requests = completed_requests + 1
         end
-    end)
+    end
 end
 
-function get_episodes(animeTitle, bangumiId)
-    local servers = get_api_servers()
+function get_episodes(animeTitle, bangumiId, source_server, original_query)
+    local servers = {}
+
+    -- 如果指定了源服务器，优先使用该服务器
+    if source_server and source_server ~= "" then
+        table.insert(servers, source_server)
+        msg.verbose("使用指定服务器: " .. source_server)
+    else
+        servers = get_api_servers()
+        msg.verbose("使用自动服务器选择，数量: " .. #servers)
+    end
+
     local endpoint = "/api/v2/bangumi/" .. bangumiId
     local items = {}
-
     local message = "加载数据中...(" .. #servers .. "个服务器)"
     local menu_type = "menu_episodes"
-    local menu_title = "剧集信息"
+    local menu_title = "剧集信息 - " .. animeTitle
     local footnote = "使用 / 打开筛选"
+
+    -- 添加返回按钮，使用原始搜索关键词
+    local return_query = original_query or animeTitle:match("^(.-)%s*%(%d+%)$") or animeTitle
+    table.insert(items, {
+        title = "← 返回",
+        value = { "script-message-to", mp.get_script_name(), "search-anime-event", return_query },
+        keep_open = false,
+        selectable = true,
+    })
 
     if uosc_available then
         update_menu_uosc(menu_type, menu_title, message, footnote)
     else
         show_message(message, 30)
     end
-    msg.verbose("获取剧集数据：" .. endpoint .. " (服务器数量: " .. #servers .. ")")
 
-    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
-        if not result or not result.data or not result.data.bangumi or not result.data.bangumi.episodes then
-            local message = "无结果"
-            if uosc_available then
-                update_menu_uosc(menu_type, menu_title, message, footnote)
-            else
-                show_message(message, 3)
-            end
-            msg.info("获取剧集列表失败")
-            return
-        end
+    -- 存储所有服务器的结果
+    local all_episodes = {}
+    local completed_requests = 0
+    local successful_requests = 0
 
-        local response = result.data
-        msg.info("✅ 获取到 " .. #response.bangumi.episodes .. " 个剧集 (服务器: " .. (result.server or "未知") .. ")")
+    for i, server in ipairs(servers) do
+        local url = server .. endpoint
+        local args = make_danmaku_request_args("GET", url, nil, nil)
 
-        for _, episode in ipairs(response.bangumi.episodes) do
-            table.insert(items, {
-                title = episode.episodeTitle,
-                hint = episode.episodeNumber,
-                value = { "script-message-to", mp.get_script_name(), "load-danmaku",
-                animeTitle, episode.episodeTitle, episode.episodeId },
-                keep_open = false,
-                selectable = true,
-            })
-        end
+        if args then
+            call_cmd_async(args, function(error, json)
+                completed_requests = completed_requests + 1
 
-        if uosc_available then
-            update_menu_uosc(menu_type, menu_title, items, footnote)
-        elseif input_loaded then
-            mp.add_timeout(0.1, function()
-                open_menu_select(items)
+                local result_data = nil
+                local has_data = false
+
+                if not error and json then
+                    local success, parsed = pcall(utils.parse_json, json)
+                    if success and parsed and parsed.bangumi and parsed.bangumi.episodes then
+                        result_data = parsed
+                        has_data = true
+                        successful_requests = successful_requests + 1
+
+                        -- 记录这个服务器的剧集数据
+                        all_episodes[server] = {
+                            episodes = parsed.bangumi.episodes,
+                            count = #parsed.bangumi.episodes,
+                            bangumi = parsed.bangumi
+                        }
+                        msg.verbose("服务器 " .. server .. " 返回 " .. #parsed.bangumi.episodes .. " 个剧集")
+                    end
+                end
+
+                -- 所有请求完成后处理
+                if completed_requests == #servers then
+                    local best_server = nil
+                    local max_episodes = 0
+
+                    -- 选择剧集数量最多的服务器
+                    for srv, data in pairs(all_episodes) do
+                        if data.count > max_episodes then
+                            max_episodes = data.count
+                            best_server = srv
+                        end
+                    end
+
+                    if best_server and all_episodes[best_server] then
+                        local episodes = all_episodes[best_server].episodes
+                        msg.info("✅ 获取到 " .. #episodes .. " 个剧集 (服务器: " .. best_server .. ", 成功: " .. successful_requests .. "/" .. #servers .. ")")
+
+                        -- 按剧集号排序
+                        table.sort(episodes, function(a, b)
+                            return tonumber(a.episodeNumber or 0) < tonumber(b.episodeNumber or 0)
+                        end)
+
+                        for _, episode in ipairs(episodes) do
+                            table.insert(items, {
+                                title = episode.episodeTitle or "未知标题",
+                                hint = "第" .. (episode.episodeNumber or "?") .. "集",
+                                value = {
+                                    "script-message-to",
+                                    mp.get_script_name(),
+                                    "load-danmaku",
+                                    animeTitle,
+                                    episode.episodeTitle or "未知标题",
+                                    tostring(episode.episodeId),
+                                    best_server  -- 传递服务器信息
+                                },
+                                keep_open = false,
+                                selectable = true,
+                            })
+                        end
+
+                        if uosc_available then
+                            update_menu_uosc(menu_type, menu_title, items, footnote)
+                        elseif input_loaded then
+                            mp.add_timeout(0.1, function()
+                                open_menu_select(items)
+                            end)
+                        end
+                    else
+                        -- 如果没有结果，确保返回按钮仍然显示
+                        if #items == 1 then -- 只有返回按钮
+                            local message = "获取剧集列表失败"
+                            if uosc_available then
+                                update_menu_uosc(menu_type, menu_title, items, footnote)
+                            else
+                                show_message(message, 3)
+                            end
+                        end
+                    end
+                end
             end)
+        else
+            completed_requests = completed_requests + 1
         end
-    end)
+    end
 end
 
 function update_menu_uosc(menu_type, menu_title, menu_item, menu_footnote, menu_cmd, query)
@@ -611,19 +738,37 @@ mp.register_script_message("search-anime-event", function(query)
         get_animes(query)
     end
 end)
-mp.register_script_message("search-episodes-event", function(animeTitle, bangumiId)
+mp.register_script_message("search-episodes-event", function(animeTitle, bangumiId, source_server, original_query)
     if uosc_available then
         mp.commandv("script-message-to", "uosc", "close-menu", "menu_anime")
     end
-    get_episodes(animeTitle, bangumiId)
+    get_episodes(animeTitle, bangumiId, source_server, original_query)
 end)
 
 -- Register script message to show the input menu
-mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, episodeId)
+mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, episodeId, source_server)
     ENABLED = true
     DANMAKU.anime = animeTitle
     DANMAKU.episode = episodeTitle
-    set_episode_id(episodeId, true)
+
+    -- 如果有指定服务器，临时设置使用该服务器
+    if source_server and source_server ~= "" then
+        -- 保存原始服务器设置
+        local original_servers = options.api_servers
+        local original_server = options.api_server
+
+        -- 临时设置为指定服务器
+        options.api_servers = source_server
+        options.api_server = source_server
+
+        set_episode_id(episodeId, true)
+
+        -- 恢复原始服务器设置
+        options.api_servers = original_servers
+        options.api_server = original_server
+    else
+        set_episode_id(episodeId, true)
+    end
 end)
 
 mp.register_script_message("add-source-event", function(query)

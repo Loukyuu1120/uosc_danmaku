@@ -523,7 +523,6 @@ local function match_episode(animeTitle, bangumiId, episode_num)
 
         local data = utils.parse_json(json)
         if not data or not data.bangumi or not data.bangumi.episodes then
-            msg.info("无结果")
             return
         end
 
@@ -589,7 +588,6 @@ local function query_tmdb_chinese_title(title, class)
 
     -- 检查curl命令是否执行成功
     if res.status ~= 0 then
-        msg.error("curl命令执行失败: " .. (res.stderr or "未知错误"))
         return nil
     end
 
@@ -597,12 +595,10 @@ local function query_tmdb_chinese_title(title, class)
 
     -- 检查HTTP状态码
     if data and data.status_code and data.status_code == 34 then
-        msg.error("TMDB资源未找到: " .. title)
         return nil
     end
 
     if not data or not data.results or #data.results == 0 then
-        msg.error("TMDB搜索无结果: " .. title)
         return nil
     end
 
