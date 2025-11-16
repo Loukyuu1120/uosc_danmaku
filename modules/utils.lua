@@ -532,9 +532,6 @@ function parse_title()
                 return title_replace(media_title), season, episode
             else
                 media_title, episode = title:match("^(.-)%s*[eE](%d+)")
-                if episode and tonumber(episode) and tonumber(episode) >= 720 then
-                    episode = nil
-                end
                 if episode then
                     return title_replace(media_title), season, episode
                 end
@@ -575,9 +572,6 @@ function parse_title()
                 title = media_title
             else
                 media_title, episode = format_title:match("^(.-)%s*[eE](%d+)")
-                if episode and tonumber(episode) and tonumber(episode) >= 720 then
-                    episode = nil
-                end
                 if episode then
                     season = 1
                     title = media_title

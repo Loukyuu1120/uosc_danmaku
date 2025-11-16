@@ -18,7 +18,8 @@ function ConcurrentManager:new()
         max_concurrent = 6,
         pending_requests = {},
         results = {},
-        final_callback = nil
+        final_callback = nil,
+        server_results = {}
     }
     setmetatable(o, self)
     self.__index = self
@@ -37,23 +38,27 @@ function ConcurrentManager:check_completion()
     end
 end
 
-function ConcurrentManager:start_request(key, request_func)
+function ConcurrentManager:start_request(server, key, request_func)
     if self.active_requests >= self.max_concurrent then
-        table.insert(self.pending_requests, {key = key, func = request_func})
+        table.insert(self.pending_requests, {server = server, key = key, func = request_func})
         return
     end
-    self:do_request(key, request_func)
+    self:do_request(server, key, request_func)
 end
 
-function ConcurrentManager:do_request(key, request_func)
+function ConcurrentManager:do_request(server, key, request_func)
     self.active_requests = self.active_requests + 1
     request_func(function(result)
-        self.results[key] = result
+        if not self.results[server] then
+            self.results[server] = {}
+        end
+        self.results[server][key] = result
+
         self.active_requests = self.active_requests - 1
 
         if #self.pending_requests > 0 and self.active_requests < self.max_concurrent then
             local next_request = table.remove(self.pending_requests, 1)
-            self:do_request(next_request.key, next_request.func)
+            self:do_request(next_request.server, next_request.key, next_request.func)
         end
 
         self:check_completion()
@@ -94,7 +99,7 @@ function make_concurrent_danmaku_request(servers, endpoint, method, headers, bod
         local args = make_danmaku_request_args(method, url, headers, body)
 
         if args then
-            concurrent_manager:start_request(i, function(cb)
+            concurrent_manager:start_request(server, i, function(cb)
                 call_cmd_async(args, function(error, json)
                     local result = {
                         server = server,
@@ -115,7 +120,10 @@ function make_concurrent_danmaku_request(servers, endpoint, method, headers, bod
                 end)
             end)
         else
-            concurrent_manager.results[i] = {
+            if not concurrent_manager.results[server] then
+                concurrent_manager.results[server] = {}
+            end
+            concurrent_manager.results[server][i] = {
                 server = server,
                 error = "无法生成请求参数",
                 data = nil
@@ -125,9 +133,9 @@ function make_concurrent_danmaku_request(servers, endpoint, method, headers, bod
 
     concurrent_manager:wait_all(function()
         local results = {}
-        for i = 1, total_servers do
-            if concurrent_manager.results[i] then
-                table.insert(results, concurrent_manager.results[i])
+        for server, server_results in pairs(concurrent_manager.results) do
+            for i, result in pairs(server_results) do
+                table.insert(results, result)
             end
         end
 
@@ -138,40 +146,65 @@ function make_concurrent_danmaku_request(servers, endpoint, method, headers, bod
         local is_comment_request = endpoint:find("/comment") ~= nil or endpoint:find("/extcomment") ~= nil
 
         if is_search_request then
-            local merged_result = {
-                server = "merged",
-                error = nil,
-                data = {
-                    animes = {},
-                    success = true,
-                    errorCode = 0,
-                    errorMessage = ""
-                }
-            }
-
-            local total_animes = 0
-            local seen_anime_ids = {}
+            local best_server = nil
+            local max_anime_count = 0
 
             for _, result in ipairs(results) do
                 if result.data and result.data.animes then
-                    for _, anime in ipairs(result.data.animes) do
-                        local anime_id = anime.bangumiId or anime.animeId
-
-                        if anime_id and not seen_anime_ids[anime_id] then
-                            table.insert(merged_result.data.animes, anime)
-                            seen_anime_ids[anime_id] = true
-                            total_animes = total_animes + 1
-                        end
+                    local anime_count = #result.data.animes
+                    if anime_count > max_anime_count then
+                        max_anime_count = anime_count
+                        best_server = result.server
                     end
                 end
             end
 
-            if total_animes > 0 then
-                callback(merged_result)
+            if not best_server then
+                for _, result in ipairs(results) do
+                    if result.data and result.data.animes and #result.data.animes > 0 then
+                        best_server = result.server
+                        break
+                    end
+                end
+            end
+
+            if best_server then
+                local merged_result = {
+                    server = best_server,
+                    error = nil,
+                    data = {
+                        animes = {},
+                        success = true,
+                        errorCode = 0,
+                        errorMessage = ""
+                    }
+                }
+
+                local total_animes = 0
+                local seen_anime_ids = {}
+
+                for _, result in ipairs(results) do
+                    if result.data and result.data.animes then
+                        for _, anime in ipairs(result.data.animes) do
+                            local anime_id = anime.bangumiId or anime.animeId
+
+                            if anime_id and not seen_anime_ids[anime_id] then
+                                table.insert(merged_result.data.animes, anime)
+                                seen_anime_ids[anime_id] = true
+                                total_animes = total_animes + 1
+                            end
+                        end
+                    end
+                end
+
+                if total_animes > 0 then
+                    callback(merged_result)
+                else
+                    select_best_single_result(results, callback, "animes")
+                end
             else
                 select_best_single_result(results, callback, "animes")
             end
-
         elseif is_comment_request then
             local best_result = nil
             local max_comments = 0
@@ -278,108 +311,9 @@ function get_api_servers()
     end
 end
 
--- 使用并发请求获取弹幕
-function fetch_danmaku_concurrent(episodeId, from_menu)
-    local servers = get_api_servers()
-    local endpoint = "/api/v2/comment/" .. episodeId .. "?withRelated=true&chConvert=0"
-
-    show_message("弹幕加载中...(" .. #servers .. "个服务器)", 30)
-
-    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
-        if result then
-            if result.data and result.data.comments then
-                local url = result.server .. endpoint
-                handle_fetched_danmaku(result.data, url, from_menu)
-            else
-                show_message("弹幕获取失败: 无弹幕数据", 3)
-                msg.error("弹幕获取失败: 无弹幕数据")
-            end
-        else
-            show_message("弹幕获取失败: 所有服务器请求失败", 3)
-            msg.error("弹幕获取失败: 所有服务器请求失败")
-        end
-    end)
-end
-
--- 并发获取所有相关弹幕
-function fetch_danmaku_all_concurrent(episodeId, from_menu)
-    local servers = get_api_servers()
-    local endpoint = "/api/v2/related/" .. episodeId
-
-    show_message("弹幕加载中...(" .. #servers .. "个服务器)", 30)
-
-    make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
-        if not result or not result.data or not result.data.relateds then
-            show_message("无相关弹幕数据", 3)
-            fetch_danmaku_all(episodeId, from_menu)
-            return
-        end
-
-        local relateds = result.data.relateds
-        local filtered_relateds = filter_excluded_platforms(relateds)
-
-        if #filtered_relateds == 0 then
-            local main_url = (result.server or options.api_server) .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
-            handle_main_danmaku(main_url, from_menu)
-            return
-        end
-
-        local concurrent_manager = ConcurrentManager:new()
-        local total_related = #filtered_relateds
-
-        for index, related in ipairs(filtered_relateds) do
-            concurrent_manager:start_request(index, function(cb)
-                local shift = related.shift
-                local base_server = result.server or options.api_server
-                local url = base_server .. "/api/v2/extcomment?url=" .. url_encode(related.url)
-                local args = make_danmaku_request_args("GET", url)
-
-                if args then
-                    call_cmd_async(args, function(error, json)
-                        local comments = {}
-                        if not error and json then
-                            local data = utils.parse_json(json)
-                            if data and data.comments then
-                                for _, comment in ipairs(data.comments) do
-                                    comment.shift = shift
-                                    table.insert(comments, comment)
-                                end
-                            end
-                        end
-                        cb(comments)
-                    end)
-                else
-                    cb({})
-                end
-            end)
-        end
-
-        concurrent_manager:wait_all(function()
-            local related_count = 0
-            for i = 1, total_related do
-                if concurrent_manager.results[i] then
-                    local comments = concurrent_manager.results[i]
-                    if #comments > 0 then
-                        local related = filtered_relateds[i]
-                        save_danmaku_data(comments, related.url, "api_server")
-                        related_count = related_count + 1
-                    end
-                end
-            end
-
-            concurrent_manager.results = {}
-
-            local base_server = result.server or options.api_server
-            local main_url = base_server .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
-            handle_main_danmaku(main_url, from_menu)
-        end)
-    end)
-end
-
-
 -- 写入history.json
 -- 读取episodeId获取danmaku
-function set_episode_id(input, from_menu)
+function set_episode_id(input, target_server, from_menu)
     from_menu = from_menu or false
     DANMAKU.source = "dandanplay"
     for url, source in pairs(DANMAKU.sources) do
@@ -396,26 +330,21 @@ function set_episode_id(input, from_menu)
         end
     end
     local episodeId = tonumber(input)
-    write_history(episodeId)
+    write_history(episodeId, target_server)
     set_danmaku_button()
-
-    local use_concurrent = options.api_servers and #options.api_servers > 1
-
-    if options.load_more_danmaku then
-        if use_concurrent then
-            fetch_danmaku_all_concurrent(episodeId, from_menu)
-        else
-            fetch_danmaku_all(episodeId, from_menu)
+    local server = target_server
+    if not server then
+        for _, s in pairs(get_api_servers()) do
+            fetch_danmaku(episodeId, from_menu, s)
         end
     else
-        if use_concurrent then
-            fetch_danmaku_concurrent(episodeId, from_menu)
+        if options.load_more_danmaku and server:find("api%.dandanplay%.") then
+            fetch_danmaku_all(episodeId, from_menu, server)
         else
-            fetch_danmaku(episodeId, from_menu)
+            fetch_danmaku(episodeId, from_menu, server)
         end
     end
 end
-
 
 -- 回退使用额外的弹幕获取方式
 function get_danmaku_fallback(query)
@@ -505,24 +434,96 @@ function make_danmaku_request_args(method, url, headers, body)
 end
 
 -- 尝试通过解析文件名匹配剧集
-local function match_episode(animeTitle, bangumiId, episode_num)
-    local url = options.api_server .. "/api/v2/bangumi/" .. bangumiId
-    local args = make_danmaku_request_args("GET", url)
+local function match_episode(animeTitle, bangumiId, episode_num, target_server)
+    local servers = target_server and {target_server} or get_api_servers()
+    local endpoint = "/api/v2/bangumi/" .. bangumiId
 
-    if args == nil then
-        return
+    local concurrent_manager = ConcurrentManager:new()
+    local total_servers = #servers
+    local has_valid_response = false
+    local selected_result = nil
+    for _, server in ipairs(servers) do
+        msg.info("尝试使用服务器: " .. server)
+    end
+    for i, server in ipairs(servers) do
+        local url = server .. endpoint
+        local args = make_danmaku_request_args("GET", url)
+        msg.info("尝试获取番剧信息: " .. url)
+
+        if args then
+            concurrent_manager:start_request(server, i, function(cb)
+                call_cmd_async(args, function(error, json)
+                    local result = {
+                        server = server,
+                        error = error,
+                        data = nil,
+                        success = false
+                    }
+
+                    if not error and json then
+                        local success, parsed = pcall(utils.parse_json, json)
+                        if success and parsed then
+                            result.data = parsed
+                            result.success = true
+                        else
+                            result.error = "JSON解析失败"
+                        end
+                    end
+
+                    cb(result)
+                end)
+            end)
+        else
+            if not concurrent_manager.results[server] then
+                concurrent_manager.results[server] = {}
+            end
+            concurrent_manager.results[server][i] = {
+                server = server,
+                error = "无法生成请求参数",
+                data = nil,
+                success = false
+            }
+        end
     end
 
-    call_cmd_async(args, function(error, json)
-        async_running = false
-        if error then
-            show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            msg.error(error)
+    concurrent_manager:wait_all(function()
+        for server, server_results in pairs(concurrent_manager.results) do
+            for i, result in pairs(server_results) do
+                if result and result.success and result.data and result.data.bangumi and result.data.bangumi.episodes then
+                    selected_result = result
+                    has_valid_response = true
+                    msg.info("使用服务器响应: " .. result.server)
+                    break
+                end
+            end
+            if selected_result then break end
+        end
+
+        if not has_valid_response then
+            for server, server_results in pairs(concurrent_manager.results) do
+                for i, result in pairs(server_results) do
+                    if result and result.data then
+                        selected_result = result
+                        msg.info("回退使用服务器: " .. result.server)
+                        break
+                    end
+                end
+                if selected_result then break end
+            end
+        end
+
+        if not selected_result or not selected_result.data or not selected_result.data.bangumi then
+            if selected_result and selected_result.error then
+                msg.error("获取番剧信息失败: " .. selected_result.error)
+            else
+                msg.error("获取番剧信息失败: 所有服务器请求失败")
+            end
             return
         end
 
-        local data = utils.parse_json(json)
-        if not data or not data.bangumi or not data.bangumi.episodes then
+        local data = selected_result.data
+        if not data.bangumi or not data.bangumi.episodes then
+            msg.error("番剧数据格式错误")
             return
         end
 
@@ -531,7 +532,7 @@ local function match_episode(animeTitle, bangumiId, episode_num)
             if ep_num and ep_num == tonumber(episode_num) then
                 DANMAKU.anime = animeTitle
                 DANMAKU.episode = episode.episodeTitle
-                set_episode_id(episode.episodeId)
+                set_episode_id(episode.episodeId, selected_result.server)
                 break
             end
         end
@@ -623,13 +624,11 @@ function match_anime_concurrent()
     local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
 
     make_concurrent_danmaku_request(servers, endpoint, "GET", nil, nil, function(result)
-
         if result then
-
             local animes = result.data and result.data.animes or {}
+            local result_server = result.server
 
             if #animes > 0 then
-                -- 原有的匹配逻辑
                 local filtered_animes = {}
                 local anime_type = "tvseries"
                 local type_count = 0
@@ -640,23 +639,24 @@ function match_anime_concurrent()
                 elseif lower_title:match("剧场版") or lower_title:match("movie") or lower_title:match("劇場版") then
                     anime_type = "movie"
                 end
-
                 local function filter_by_type(animes, t)
                     local result = {}
                     for _, a in ipairs(animes) do
-                        if a.type == t then table.insert(result, a) end
+                        if a.type == t or (t == "tvseries" and (a.type == "jpdrama")) then
+                            table.insert(result, a)
+                        end
                     end
                     return result
                 end
 
                 local filtered_animes = filter_by_type(animes, anime_type)
-                -- movie类型作为备选
+                -- movie 作为备选
                 if #filtered_animes == 0 and anime_type == "tvseries" and not season_num then
                     filtered_animes = filter_by_type(animes, "movie")
                 end
 
                 if #filtered_animes == 1 then
-                    match_episode(filtered_animes[1].animeTitle, filtered_animes[1].bangumiId, episode_num)
+                    match_episode(filtered_animes[1].animeTitle, filtered_animes[1].bangumiId, episode_num, result_server)
                 elseif #filtered_animes > 1 then
                     -- 改进的模糊匹配逻辑
                     local best_match, best_score = nil, -1
@@ -699,7 +699,7 @@ function match_anime_concurrent()
                     local threshold = 0.75
                     if best_match and best_score >= threshold then
                         msg.info("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_score) .. ")")
-                        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num)
+                        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server)
                     end
                 else
                     msg.info("❌ 没有找到合适的匹配结果")
@@ -753,7 +753,7 @@ local function match_file_concurrent(file_path, file_name, callback)
     local endpoint = "/api/v2/match"
     local body = {
         fileName = file_name,
-        fileHash = hash or "",
+        fileHash = hash or "a1b2c3d4e5f67890abcd1234ef567890",
         matchMode = hash and "hashAndFileName" or "fileNameOnly"
     }
 
@@ -764,10 +764,9 @@ local function match_file_concurrent(file_path, file_name, callback)
             callback("没有匹配的剧集")
             return
         end
-
         DANMAKU.anime = result.data.matches[1].animeTitle
         DANMAKU.episode = result.data.matches[1].episodeTitle
-        set_episode_id(result.data.matches[1].episodeId)
+        set_episode_id(result.data.matches[1].episodeId, result.server)
     end)
 end
 
@@ -830,7 +829,7 @@ function handle_danmaku_data(query, data, from_menu)
             -- 空循环，等待 2 秒
         end
         -- 重新发起请求
-        local url = options.api_server .. "/api/v2/extcomment?url=" .. url_encode(query)
+        local url = get_api_servers()[1] .. "/api/v2/extcomment?url=" .. url_encode(query)
         local args = make_danmaku_request_args("GET", url)
 
         if args == nil then
@@ -853,7 +852,7 @@ end
 
 -- 处理第三方弹幕数据
 function handle_related_danmaku(index, relateds, related, shift, callback)
-    local url = options.api_server .. "/api/v2/extcomment?url=" .. url_encode(related["url"])
+    local url = get_api_servers()[1] .. "/api/v2/extcomment?url=" .. url_encode(related["url"])
     show_message(string.format("正在从第三方库装填弹幕 [%d/%d]", index, #relateds), 30)
     msg.verbose("正在从第三方库装填弹幕：" .. url)
 
@@ -934,15 +933,14 @@ function handle_fetched_danmaku(data, url, from_menu)
             if DANMAKU.sources[url] == nil then
                 DANMAKU.sources[url] = {from = "api_server"}
             end
-            show_message("该集弹幕内容为空，结束加载", 3)
-            msg.verbose("该集弹幕内容为空，结束加载")
+            msg.verbose("弹幕内容为空，结束加载url：" .. url)
             return
         end
         save_danmaku_data(data["comments"], url, "api_server")
+        msg.info("弹幕加载url：" .. url)
         load_danmaku(from_menu)
     else
-        show_message("无数据", 3)
-        msg.info("无数据")
+        msg.verbose("无数据，结束加载url：" .. url)
     end
 end
 
@@ -989,8 +987,9 @@ end
 
 -- 匹配弹幕库 comment, 仅匹配dandan本身弹幕库
 -- 通过danmaku api（url）+id获取弹幕
-function fetch_danmaku(episodeId, from_menu)
-    local url = options.api_server .. "/api/v2/comment/" .. episodeId .. "?withRelated=true&chConvert=0"
+function fetch_danmaku(episodeId, from_menu, specific_server)
+    local server = specific_server or get_api_servers()[1]
+    local url = server .. "/api/v2/comment/" .. episodeId .. "?withRelated=true&chConvert=0"
     show_message("弹幕加载中...", 30)
     msg.verbose("尝试获取弹幕：" .. url)
     local args = make_danmaku_request_args("GET", url)
@@ -1005,8 +1004,9 @@ function fetch_danmaku(episodeId, from_menu)
 end
 
 -- 主函数：获取所有相关弹幕
-function fetch_danmaku_all(episodeId, from_menu)
-    local url = options.api_server .. "/api/v2/related/" .. episodeId
+function fetch_danmaku_all(episodeId, from_menu, specific_server)
+    local server = specific_server or get_api_servers()[1]
+    local url = server .. "/api/v2/related/" .. episodeId
     show_message("弹幕加载中...", 30)
     msg.verbose("尝试获取弹幕：" .. url)
     local args = make_danmaku_request_args("GET", url)
@@ -1028,7 +1028,7 @@ function fetch_danmaku_all(episodeId, from_menu)
         local function process_related(index)
             if index > #filtered_relateds then
                 -- 所有相关弹幕加载完成后，开始加载主库弹幕
-                url = options.api_server .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
+                url = server .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
                 handle_main_danmaku(url, from_menu)
                 return
             end
@@ -1118,7 +1118,7 @@ end
 --通过输入源url获取弹幕库
 function add_danmaku_source_online(query, from_menu)
     set_danmaku_button()
-    local url = options.api_server .. "/api/v2/extcomment?url=" .. url_encode(query)
+    local url = get_api_servers()[1] .. "/api/v2/extcomment?url=" .. url_encode(query)
     show_message("弹幕加载中...", 30)
     msg.verbose("尝试获取弹幕：" .. url)
     local args = make_danmaku_request_args("GET", url)

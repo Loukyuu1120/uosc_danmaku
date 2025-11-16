@@ -196,7 +196,7 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query)
 
                         -- 按剧集号排序
                         table.sort(episodes, function(a, b)
-                            return tonumber(a.episodeNumber or 0) < tonumber(b.episodeNumber or 0)
+                            return (tonumber(a.episodeNumber) or 0) < (tonumber(b.episodeNumber) or 0)
                         end)
 
                         for _, episode in ipairs(episodes) do
@@ -761,13 +761,13 @@ mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, ep
         options.api_servers = source_server
         options.api_server = source_server
 
-        set_episode_id(episodeId, true)
+        set_episode_id(episodeId, source_server, true)
 
         -- 恢复原始服务器设置
         options.api_servers = original_servers
         options.api_server = original_server
     else
-        set_episode_id(episodeId, true)
+        set_episode_id(episodeId, nil, true)
     end
 end)
 

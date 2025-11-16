@@ -313,7 +313,7 @@ local function clear_source()
     msg.verbose("已重置当前视频所有弹幕源更改")
 end
 
-function write_history(episodeid)
+function write_history(episodeid, server)
     local history = {}
     local path = mp.get_property("path")
     local dir = get_parent_directory(path)
@@ -349,6 +349,9 @@ function write_history(episodeid)
         history[dir].animeTitle = DANMAKU.anime
         history[dir].episodeTitle = DANMAKU.episode
         history[dir].episodeNumber = episodeNumber
+        if server then
+            history[dir].server = server
+        end
         if episodeid then
             history[dir].episodeId = episodeid
         elseif DANMAKU.extra then
@@ -770,6 +773,7 @@ function auto_load_danmaku(path, dir, filename, number)
                 local history_id = history_dir.episodeId
                 local history_fname = history_dir.fname
                 local history_extra = history_dir.extra
+                local history_server = history_dir.server or nil
                 local playing_number = nil
 
                 if history_fname then
@@ -792,7 +796,7 @@ function auto_load_danmaku(path, dir, filename, number)
                     msg.verbose("自动加载上次匹配的弹幕")
                     if history_id then
                         local tmp_id = tostring(x + history_id)
-                        set_episode_id(tmp_id)
+                        set_episode_id(tmp_id, history_server)
                     elseif history_extra then
                         local episodenum = history_extra.episodenum + x
                         get_details(history_extra.class, history_extra.id, history_extra.site,
