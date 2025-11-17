@@ -4,7 +4,7 @@ local utils = require("mp.utils")
 ------------------------------------------------
 -- 并发请求管理器
 ------------------------------------------------
-local ConcurrentManager = {
+ConcurrentManager = {
     active_requests = 0,
     max_concurrent = 6, -- 最大并发数
     pending_requests = {},
@@ -33,8 +33,9 @@ end
 
 function ConcurrentManager:check_completion()
     if self.active_requests == 0 and #self.pending_requests == 0 and self.final_callback then
-        self.final_callback()
+        local callback = self.final_callback
         self.final_callback = nil
+        callback()
     end
 end
 
@@ -486,7 +487,6 @@ function match_anime_concurrent(callback)
                         valid_anime_count = valid_anime_count + 1
                     end
                 end
-
                 if valid_anime_count > 0 then
                     selected_result = result
                     break
@@ -495,8 +495,7 @@ function match_anime_concurrent(callback)
         end
 
         if selected_result then
-            process_search_result(selected_result, title, season_num, episode_num)
-            if callback then callback(nil) end
+            process_search_result(selected_result, title, season_num, episode_num, callback)
         else
             if callback then callback("anime_match 没有匹配") end
         end
@@ -536,7 +535,7 @@ end
 
 
 
-function process_search_result(result, title, season_num, episode_num)
+function process_search_result(result, title, season_num, episode_num, callback)
     local animes = result.data.animes
     local result_server = result.server
 
@@ -560,20 +559,18 @@ function process_search_result(result, title, season_num, episode_num)
         return result
     end
 
-    local filtered_animes = filter_by_type(animes, anime_type)
-    -- movie 作为备选
+    filtered_animes = filter_by_type(animes, anime_type)
     if #filtered_animes == 0 and anime_type == "tvseries" and not season_num then
         filtered_animes = filter_by_type(animes, "movie")
     end
 
     msg.info("过滤后动画数量: " .. #filtered_animes .. " (类型: " .. anime_type .. ")")
 
+    local best_match, best_score = nil, -1
     if #filtered_animes == 1 then
-        msg.info("✅ 精确匹配: " .. filtered_animes[1].animeTitle .. " (来自服务器: " .. result_server .. ")")
-        match_episode(filtered_animes[1].animeTitle, filtered_animes[1].bangumiId, episode_num, result_server)
+        best_match = filtered_animes[1]
+        best_score = 1
     elseif #filtered_animes > 1 then
-        -- 模糊匹配逻辑
-        local best_match, best_score = nil, -1
         local base_title = title:gsub("%s*%(%d+%)", ""):gsub("^%s*(.-)%s*$", "%1")
         local target_title = base_title
         if is_english(base_title) then
@@ -599,10 +596,8 @@ function process_search_result(result, title, season_num, episode_num)
             local anime_title = anime.animeTitle or ""
             local score = jaro_winkler(target_title, anime_title)
             local anime_season = extract_season(anime_title)
-            if tonumber(season_num) > 0 then
-                if anime_season ~= tonumber(season_num) then
-                    score = score - 0.2
-                end
+            if tonumber(season_num) > 0 and anime_season ~= tonumber(season_num) then
+                score = score - 0.2
             end
             msg.info("候选: " .. anime_title .. " -> 相似度 " .. string.format("%.3f", score))
 
@@ -611,12 +606,16 @@ function process_search_result(result, title, season_num, episode_num)
                 best_match = anime
             end
         end
+    end
 
-        local threshold = 0.75
-        if best_match and best_score >= threshold then
-            msg.info("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_score) .. ", 服务器: " .. result_server .. ")")
-            match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server)
-        end
+    local threshold = 0.75
+    if best_match and best_score >= threshold and not best_match.animeTitle:find("搜索正在") then
+        msg.info("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_score) .. ", 服务器: " .. result_server .. ")")
+        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server)
+        if callback then callback(nil) end
+    else
+        msg.warn("anime_match 没有找到相似度 >= " .. threshold)
+        if callback then callback("anime_match 相似度不足") end
     end
 end
 
@@ -1116,7 +1115,7 @@ function get_danmaku_with_hash(file_name, file_path)
     local servers = get_api_servers()
     local priority_strategy = "file_match"
     if servers[1] and servers[1]:find("api%.dandanplay%.") then
-        msg.info("检测到 dandanplay 官方服务器，优先使用 anime_match 策略")
+        msg.info("检测到 首选项 为 dandanplay，优先使用 anime_match 策略")
         priority_strategy = "anime_match"
     end
     if type(MD5) ~= "table" or not MD5.sum then

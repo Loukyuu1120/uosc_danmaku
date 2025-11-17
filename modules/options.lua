@@ -28,6 +28,8 @@ options = {
     merge_tolerance = -1,
     -- 指定弹幕关联历史记录文件的路径，支持绝对路径和相对路径
     history_path = "~~/danmaku-history.json",
+    -- 指定匹配结果缓存文件的路径，支持绝对路径和相对路径
+    match_cache_path = "~~/uosc_danmaku_match_cache.json",
     open_search_danmaku_menu_key = "Ctrl+d",
     show_danmaku_keyboard_key = "j",
     -- 中文简繁转换。0-不转换，1-转换为简体，2-转换为繁体
@@ -38,7 +40,7 @@ options = {
     fixtime = 5,
     --字体
     fontname = "sans-serif",
-    --字体大小 
+    --字体大小
     fontsize = 50,
     --字体阴影
     shadow = 0,
@@ -64,7 +66,7 @@ options = {
     -- 自定义标题解析中的额外替换规则，内容格式为 JSON 字符串，替换模式为 lua 的 string.gsub 函数
     --! 注意：由于 mpv 的 lua 版本限制，自定义规则只支持形如 %n 的捕获组写法，即示例用法，不支持直接替换字符的写法
     title_replace = [[
-       [{ 
+       [{
            "rules": [{ "^〔(.-)〕": "%1"},{ "^.*《(.-)》": "%1" }],
        }]
     ]],

@@ -882,6 +882,16 @@ mp.register_event("file-loaded", function()
     if ENABLED and COMMENTS == nil and not async_running then
         init(path)
     end
+
+    -- 在文件加载时自动加载匹配结果（用于弹幕源选择菜单）
+    if uosc_available and path and not is_protocol(path) then
+        mp.add_timeout(1.0, function()
+            -- 延迟加载，避免影响正常播放
+            if ENABLED then
+                mp.commandv("script-message", "auto_load_danmaku_matches")
+            end
+        end)
+    end
 end)
 
 -------------- 键位绑定 --------------

@@ -152,6 +152,11 @@ function parse_danmaku(ass_file_path, from_menu, no_osd)
             end
             mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "on")
             show_danmaku_func()
+
+            -- 弹幕加载完成后，自动加载匹配结果到缓存
+            mp.add_timeout(0.5, function()
+                mp.commandv("script-message", "auto_load_danmaku_matches")
+            end)
         else
             show_message("")
             hide_danmaku_func()
