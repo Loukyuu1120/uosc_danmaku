@@ -1066,6 +1066,35 @@ history_path=/path/to/your/danmaku-history.json
 
 ---
 
+<details>
+<summary>
+history_path
+
+> 指定弹幕关联历史记录文件路径
+
+</summary>
+
+### match_cache_path
+
+#### 功能说明
+
+指定弹幕关联历史记录文件的路径，支持绝对路径和相对路径。默认值是 `~~/uosc_danmaku_match_cache.json`也就是 mpv 配置文件夹的根目录下
+
+#### 使用示例
+
+想要配置此选项，请在 mpv 配置文件夹下的 `script-opts`中创建 `uosc_danmaku.conf`文件并添加类似如下内容：
+
+> **⚠️IMPORTANT**
+> 不要直接复制这里的配置，这只是一个示例，路径要写成真实存在的路径。此选项可以不配置，脚本会默认放在 mpv 配置文件夹的根目录下。
+
+```
+match_cache_path=/path/to/your/match_cache.json
+```
+
+</details>
+
+---
+
 ### 自定义弹幕样式相关配置
 
 默认配置如下，可根据需求更改并自定义弹幕样式
