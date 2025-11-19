@@ -4,6 +4,15 @@ local utils = require("mp.utils")
 input_loaded, input = pcall(require, "mp.input")
 uosc_available = false
 
+-- 保存当前菜单状态，用于展开剧集列表
+local current_menu_state = {
+    all_results = nil,
+    servers = nil,
+    expanded_key = nil,  -- 格式: "server|animeTitle"
+    episodes = nil,
+    selected_episode = nil,
+}
+
 local function extract_server_identifier(server_url)
     if not server_url then
         return "未知"
@@ -268,6 +277,60 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query)
                                 selectable = true,
                             })
                         end
+
+                        -- 更新缓存和菜单状态：将选择的结果保存到缓存中（从搜索菜单选择的结果）
+                        -- 找到当前集数对应的episode
+                        local _, _, current_episode_num = parse_title()
+                        current_episode_num = tonumber(current_episode_num) or 1
+
+                        local selected_episode = nil
+                        for _, episode in ipairs(episodes) do
+                            local ep_num = tonumber(episode.episodeNumber)
+                            if ep_num and ep_num == current_episode_num then
+                                selected_episode = episode
+                                break
+                            end
+                        end
+
+                        -- 确保菜单状态存在
+                        if not current_menu_state.all_results then
+                            current_menu_state.all_results = {}
+                        end
+                        if not current_menu_state.all_results[best_server] then
+                            current_menu_state.all_results[best_server] = {}
+                        end
+
+                        if selected_episode then
+                            local match = {
+                                animeTitle = animeTitle,
+                                episodeTitle = selected_episode.episodeTitle or "未知标题",
+                                episodeId = selected_episode.episodeId,
+                                bangumiId = bangumiId,
+                                match_type = "episode",
+                                similarity = 1.0
+                            }
+                            save_match_to_cache(best_server, {match}, "episode", {}, true)
+
+                            -- 更新菜单状态
+                            current_menu_state.all_results[best_server].matches = {match}
+                            current_menu_state.all_results[best_server].match_type = "episode"
+                        else
+                            local fallback_match = {
+                                animeTitle = animeTitle,
+                                bangumiId = bangumiId,
+                                similarity = 1.0
+                            }
+                            save_match_to_cache(best_server, {fallback_match}, "anime", {}, true)
+
+                            -- 更新菜单状态
+                            current_menu_state.all_results[best_server].matches = {fallback_match}
+                            current_menu_state.all_results[best_server].match_type = "anime"
+                        end
+
+                        -- 确保菜单状态的其他字段也被设置
+                        current_menu_state.servers = get_api_servers()
+                        current_menu_state.expanded_key = nil
+                        current_menu_state.episodes = nil
 
                         if uosc_available then
                             update_menu_uosc(menu_type, menu_title, items, footnote)
@@ -809,11 +872,33 @@ mp.register_script_message("search-episodes-event", function(animeTitle, bangumi
     get_episodes(animeTitle, bangumiId, source_server, original_query)
 end)
 
--- Register script message to show the input menu
-mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, episodeId, source_server)
+-- 注册加载函数给 uosc 按钮使用
+mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, episodeId, source_server, bangumiId)
     ENABLED = true
     DANMAKU.anime = animeTitle
     DANMAKU.episode = episodeTitle
+
+    -- 确定使用的服务器
+    local used_server = source_server
+    if not used_server or used_server == "" then
+        -- 从history中读取服务器信息
+        local path = mp.get_property("path")
+        local dir = get_parent_directory(path)
+        if dir then
+            local history_json = read_file(HISTORY_PATH)
+            if history_json then
+                local history = utils.parse_json(history_json) or {}
+                if history[dir] and history[dir].server then
+                    used_server = history[dir].server
+                end
+            end
+        end
+        -- 如果还是没有，使用第一个服务器
+        if not used_server then
+            local servers = get_api_servers()
+            used_server = servers[1]
+        end
+    end
 
     -- 如果有指定服务器，临时设置使用该服务器
     if source_server and source_server ~= "" then
@@ -833,6 +918,32 @@ mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, ep
     else
         set_episode_id(episodeId, nil, true)
     end
+
+    -- 更新缓存：将选择的结果保存到缓存中
+    local match = {
+        animeTitle = animeTitle,
+        episodeTitle = episodeTitle,
+        episodeId = tonumber(episodeId),
+        bangumiId = bangumiId,  -- 使用传递的bangumiId
+        match_type = "episode",
+        similarity = 1.0
+    }
+
+    -- 如果bangumiId为空，尝试从当前菜单状态中获取
+    if not bangumiId and current_menu_state.all_results and current_menu_state.all_results[used_server] then
+        local server_results = current_menu_state.all_results[used_server]
+        if server_results.matches and #server_results.matches > 0 then
+            local found_match = server_results.matches[1]
+            if found_match.bangumiId then
+                match.bangumiId = found_match.bangumiId
+            end
+        end
+    end
+
+    save_match_to_cache(used_server, {match}, "episode", {}, true)
+
+    --使用选中的结果保存当前菜单状态
+    save_selected_episode_with_offset(used_server, animeTitle, episodeTitle, episodeId, bangumiId)
 end)
 
 mp.register_script_message("add-source-event", function(query)
@@ -1028,42 +1139,54 @@ local function save_match_cache()
     write_json_file(MATCH_CACHE_PATH, MATCH_CACHE)
 end
 
-local function get_cache_key(file_path, file_name)
-    local path = file_path or mp.get_property("path")
-    local name = file_name or mp.get_property("filename/no-ext")
-
-    if path and not is_protocol(path) then
-        path = normalize(path)
-    end
-
-    local file_info = utils.file_info(path)
-    local file_size = file_info and file_info.size or 0
-    local file_mtime = file_info and file_info.mtime or 0
-
-    return (name or path) .. "|" .. tostring(file_size) .. "|" .. tostring(file_mtime)
+local function get_cache_key()
+    local title, season_num, episod_num = parse_title()
+    return (title) .. "|" .. tostring(season_num)
 end
 
-local function save_match_to_cache(file_path, file_name, server, matches, match_type, danmaku_counts)
-    local cache_key = get_cache_key(file_path, file_name)
+function get_current_server_from_cache()
+    local cache_key = get_cache_key()
+    if MATCH_CACHE[cache_key] then
+        return MATCH_CACHE[cache_key].current_server
+    end
+    return nil
+end
+
+function save_match_to_cache(server, matches, match_type, danmaku_counts, lock_entry, update_current_server)
+    lock_entry = lock_entry or false
+    update_current_server = update_current_server == nil and true or update_current_server
+
+    local cache_key = get_cache_key()
     if not MATCH_CACHE[cache_key] then
         MATCH_CACHE[cache_key] = {
             timestamp = os.time(),
-            servers = {}
+            servers = {},
+            current_server = nil
         }
+    end
+
+    local existing_entry = MATCH_CACHE[cache_key].servers[server]
+    if existing_entry and existing_entry.locked and not lock_entry then
+        return
     end
 
     MATCH_CACHE[cache_key].servers[server] = {
         matches = matches,
         match_type = match_type,
         timestamp = os.time(),
-        danmaku_counts = danmaku_counts or {}
+        danmaku_counts = danmaku_counts or {},
+        locked = lock_entry or nil
     }
+
+    if server and update_current_server then
+        MATCH_CACHE[cache_key].current_server = server
+    end
 
     save_match_cache()
 end
 
-local function get_match_from_cache(file_path, file_name, server)
-    local cache_key = get_cache_key(file_path, file_name)
+local function get_match_from_cache(server)
+    local cache_key = get_cache_key()
     if MATCH_CACHE[cache_key] and MATCH_CACHE[cache_key].servers[server] then
         local entry = MATCH_CACHE[cache_key].servers[server]
         local current_time = os.time()
@@ -1075,242 +1198,461 @@ local function get_match_from_cache(file_path, file_name, server)
                     danmaku_counts[tostring(k)] = v
                 end
             end
-            return entry.matches, entry.match_type, danmaku_counts
+            return entry.matches, entry.match_type, danmaku_counts, entry.locked
         end
     end
-    return nil, nil, nil
+    return nil, nil, nil, nil
 end
 
-local function get_all_servers_matches(file_path, file_name, callback)
+-- 处理搜索结果，完全使用 dandanplay.lua 的逻辑
+-- 暴露给 dandanplay.lua 使用
+function process_anime_matches(animes, title, season_num, result_server)
+    local filtered_animes = {}
+    local anime_type = "tvseries"
+    local lower_title = title:lower()
+
+    if lower_title:match("ova") or lower_title:match("oad") then
+        anime_type = "ova"
+    elseif lower_title:match("剧场版") or lower_title:match("movie") or lower_title:match("劇場版") then
+        anime_type = "movie"
+    end
+
+    local function filter_by_type(animes, t)
+        local result = {}
+        for _, a in ipairs(animes) do
+            if a.type == t or (t == "tvseries" and (a.type == "jpdrama")) then
+                table.insert(result, a)
+            end
+        end
+        return result
+    end
+
+    filtered_animes = filter_by_type(animes, anime_type)
+    if #filtered_animes == 0 and anime_type == "tvseries" and not season_num then
+        filtered_animes = filter_by_type(animes, "movie")
+    end
+
+    local best_match, best_score = nil, -1
+    if #filtered_animes == 1 then
+        best_match = filtered_animes[1]
+        best_score = 1
+    elseif #filtered_animes > 1 then
+        local base_title = title:gsub("%s*%(%d+%)", ""):gsub("^%s*(.-)%s*$", "%1")
+        local target_title = base_title
+        if is_english(base_title) then
+            local chinese_title = query_tmdb_chinese_title(base_title, anime_type)
+            if chinese_title then
+                base_title = chinese_title
+            end
+        end
+
+        if tonumber(season_num) and tonumber(season_num) > 1 then
+            target_title = base_title .. " 第" .. number_to_chinese(season_num) .. "季"
+        else
+            target_title = base_title .. " 第一季"
+        end
+
+        for _, anime in ipairs(filtered_animes) do
+            local anime_title = anime.animeTitle or ""
+            local score = jaro_winkler(target_title, anime_title)
+            local anime_season = extract_season(anime_title)
+            if tonumber(anime_season) and anime_season ~= tonumber(season_num) then
+                score = score - 0.2
+            end
+
+            if score > best_score then
+                best_score = score
+                best_match = anime
+            end
+        end
+    end
+
+    local threshold = 0.75
+    if best_match and best_score >= threshold and not best_match.animeTitle:find("搜索正在") then
+        best_match.similarity = best_score
+        return {best_match}
+    end
+
+    return {}
+end
+
+-- 处理文件匹配结果（用于非 dandanplay 服务器）
+local function process_file_match_results(results, title, servers)
+    local all_results = {}
+
+    for _, server in ipairs(servers) do
+        local r = nil
+        for _, rr in ipairs(results) do
+            if rr.server == server then
+                r = rr
+                break
+            end
+        end
+
+        local matches = {}
+        if r and r.data then
+            local data = r.data
+            if data.isMatched and data.matches and #data.matches == 1 then
+                local match = data.matches[1]
+                match.match_type = "episode"
+                match.similarity = 1.0
+
+                -- 添加判断逻辑：如果结果的animeid包含在episodeId里面且episodeId不是以animeid开头
+                if match.animeId and match.episodeId then
+                    local animeId_str = tostring(match.animeId)
+                    local episodeId_str = tostring(match.episodeId)
+
+                    -- 检查animeid是否包含在episodeId中，且episodeId不是以animeid开头
+                    if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
+                        match.bangumiId = "A" .. animeId_str
+                        msg.verbose(string.format("转换bangumiId: animeId=%s, episodeId=%s, 新bangumiId=%s",
+                            animeId_str, episodeId_str, match.bangumiId))
+                    end
+                end
+
+                matches = {match}
+            elseif data.matches and #data.matches > 1 then
+                -- 多个匹配结果，选择标题完全匹配的
+                for _, match in ipairs(data.matches) do
+                    if match.animeTitle == title then
+                        match.match_type = "episode"
+                        match.similarity = 1.0
+
+                        -- 添加相同的判断逻辑
+                        if match.animeId and match.episodeId then
+                            local animeId_str = tostring(match.animeId)
+                            local episodeId_str = tostring(match.episodeId)
+
+                            if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
+                                match.bangumiId = "A" .. animeId_str
+                                msg.verbose(string.format("转换bangumiId: animeId=%s, episodeId=%s, 新bangumiId=%s",
+                                    animeId_str, episodeId_str, match.bangumiId))
+                            end
+                        end
+
+                        matches = {match}
+                        break
+                    end
+                end
+                -- 如果没有完全匹配，使用第一个
+                if #matches == 0 then
+                    data.matches[1].match_type = "episode"
+                    data.matches[1].similarity = 0.8
+
+                    -- 添加相同的判断逻辑
+                    local match = data.matches[1]
+                    if match.animeId and match.episodeId then
+                        local animeId_str = tostring(match.animeId)
+                        local episodeId_str = tostring(match.episodeId)
+
+                        if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
+                            match.bangumiId = "A" .. animeId_str
+                            msg.verbose(string.format("转换bangumiId: animeId=%s, episodeId=%s, 新bangumiId=%s",
+                                animeId_str, episodeId_str, match.bangumiId))
+                        end
+                    end
+
+                    matches = {data.matches[1]}
+                end
+            end
+        end
+
+        all_results[server] = {
+            matches = matches,
+            match_type = "episode",
+            danmaku_counts = {},
+            from_cache = false
+        }
+    end
+
+    return all_results
+end
+
+local function get_all_servers_matches(file_path, file_name, callback, update_current_server)
+    update_current_server = update_current_server or false
     local servers = get_api_servers()
     local all_results = {}
     local completed = 0
     local total = #servers
 
-    -- 检查是否是dandanplay服务器
-    local is_dandanplay = false
-    for _, server in ipairs(servers) do
-        if server:find("api%.dandanplay%.") then
-            is_dandanplay = true
-            break
-        end
+    -- 获取当前文件的标题
+    local current_title, current_season, current_episode = parse_title()
+    if not current_title or current_title == "" then
+        if callback then callback(all_results) end
+        return
     end
 
-    local function process_results()
-        completed = completed + 1
-        if completed == total then
-            if callback then callback(all_results) end
-        end
-    end
-
-    local function get_danmaku_count(episodeId, server, callback)
-        if not episodeId then
-            callback(0)
-            return
-        end
-        local url = server .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
-        local args = make_danmaku_request_args("GET", url)
-        if args then
-            call_cmd_async(args, function(error, json)
-                local count = 0
-                if not error and json then
-                    local success, parsed = pcall(utils.parse_json, json)
-                    if success and parsed and parsed.count then
-                        count = tonumber(parsed.count) or 0
-                    end
-                end
-                callback(count)
-            end)
-        else
-            callback(0)
-        end
-    end
+    -- 先收集所有服务器的缓存状态
+    local servers_to_request = {}  -- 需要请求的服务器列表
+    local cached_servers = {}      -- 已有缓存的服务器列表
 
     for _, server in ipairs(servers) do
-        -- 先检查缓存
-        local cached_matches, cached_type, cached_counts = get_match_from_cache(file_path, file_name, server)
-        if cached_matches then
-            all_results[server] = {
+        local cached_matches, cached_type, cached_counts = get_match_from_cache(server)
+        if cached_matches and #cached_matches > 0 then
+            -- 服务器有缓存，直接使用缓存数据
+            cached_servers[server] = {
                 matches = cached_matches,
                 match_type = cached_type,
                 danmaku_counts = cached_counts or {},
                 from_cache = true
             }
-            process_results()
+            msg.verbose("服务器 " .. server .. " 使用缓存数据，跳过请求")
         else
-            if is_dandanplay and server:find("api%.dandanplay%.") then
-                local title, season_num, episode_num = parse_title()
-                episode_num = episode_num or 1
-                local cleaned_title = title
-                if cleaned_title then
-                    cleaned_title = cleaned_title:gsub("%[.-%]", "")
-                    cleaned_title = cleaned_title:gsub("%s+", " ")
-                    cleaned_title = cleaned_title:gsub("^%s+", ""):gsub("%s+$", "")
-                end
-                local encoded_query = url_encode(cleaned_title or "")
-                local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
-                local url = server .. endpoint
-                local args = make_danmaku_request_args("GET", url)
+            -- 服务器没有缓存，需要请求
+            table.insert(servers_to_request, server)
+        end
+    end
 
-                if args then
+    -- 将所有缓存数据添加到最终结果中
+    for server, cached_data in pairs(cached_servers) do
+        all_results[server] = cached_data
+    end
+
+    -- 如果没有需要请求的服务器，直接返回缓存数据
+    if #servers_to_request == 0 then
+        msg.verbose("所有服务器都有缓存，跳过网络请求")
+        if callback then callback(all_results) end
+        return
+    end
+
+    -- 初始化并发管理器
+    local concurrent_manager = ConcurrentManager:new()
+    local request_count = 0
+
+    -- 区分 dandanplay 和非 dandanplay 服务器
+    local dandanplay_servers = {}
+    local other_servers = {}
+
+    for _, server in ipairs(servers_to_request) do
+        if server:find("api%.dandanplay%.") then
+            table.insert(dandanplay_servers, server)
+        else
+            table.insert(other_servers, server)
+        end
+    end
+
+    -- 处理 dandanplay 服务器（使用搜索方式）
+    local encoded_query = clean_anime_title(current_title)
+    for i, server in ipairs(dandanplay_servers) do
+        local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
+        local url = server .. endpoint
+        local args = make_danmaku_request_args("GET", url, nil, nil)
+
+        if args then
+            request_count = request_count + 1
+            local request_func = function(callback_func)
+                call_cmd_async(args, function(error, json)
+                    local result = {
+                        success = false,
+                        server = server,
+                        animes = {}
+                    }
+
+                    if not error and json then
+                        local success, parsed = pcall(utils.parse_json, json)
+                        if success and parsed and parsed.animes then
+                            result.success = true
+                            result.animes = parsed.animes
+                        end
+                    end
+
+                    callback_func(result)
+                end)
+            end
+
+            concurrent_manager:start_request(server, i, request_func)
+        end
+    end
+
+    -- 处理非 dandanplay 服务器（使用文件匹配方式）
+    if #other_servers > 0 then
+        local hash = nil
+        local file_info = utils.file_info(file_path)
+        if file_info and file_info.size > 16 * 1024 * 1024 then
+            local file, error = io.open(normalize(file_path), 'rb')
+            if file and not error then
+                local m = MD5.new()
+                for _ = 1, 16 * 1024 do
+                    local content = file:read(1024)
+                    if not content then break end
+                    m:update(content)
+                end
+                file:close()
+                hash = m:finish()
+            end
+        end
+
+        local title, season_num, episode_num = parse_title()
+        local match_file_name = file_name
+        if title and episode_num then
+            if season_num then
+                match_file_name = title .. " S" .. season_num .. "E" .. episode_num
+            else
+                match_file_name = title .. " E" .. episode_num
+            end
+        else
+            match_file_name = title or file_name
+        end
+
+        local endpoint = "/api/v2/match"
+        local body = {
+            fileName   = match_file_name,
+            fileHash   = hash or "a1b2c3d4e5f67890abcd1234ef567890",
+            matchMode  = hash and "hashAndFileName" or "fileNameOnly"
+        }
+
+        for i, server in ipairs(other_servers) do
+            local url = server .. endpoint
+            local args = make_danmaku_request_args("POST", url, {
+                ["Content-Type"] = "application/json"
+            }, body)
+
+            if args then
+                request_count = request_count + 1
+                concurrent_manager:start_request(server, i, function(cb)
                     call_cmd_async(args, function(error, json)
-                        local matches = {}
+                        local result = {
+                            server = server,
+                            error = error,
+                            data = nil,
+                            index = i
+                        }
+
                         if not error and json then
                             local success, parsed = pcall(utils.parse_json, json)
-                            if success and parsed and parsed.animes then
-                                for _, anime in ipairs(parsed.animes) do
-                                    table.insert(matches, {
-                                        animeTitle = anime.animeTitle,
-                                        bangumiId = anime.bangumiId or anime.animeId,
-                                        typeDescription = anime.typeDescription,
-                                        match_type = "anime"
-                                    })
-                                end
+                            if success then
+                                result.data = parsed
+                            else
+                                result.error = "JSON解析失败"
                             end
                         end
-                        -- anime类型暂时不获取弹幕数（需要先获取剧集列表）
-                        all_results[server] = {
-                            matches = matches,
-                            match_type = "anime",
-                            danmaku_counts = {},
-                            from_cache = false
-                        }
-                        save_match_to_cache(file_path, file_name, server, matches, "anime", {})
-                        process_results()
+
+                        cb(result)
                     end)
-                else
+                end)
+            else
+                if not concurrent_manager.results[server] then
+                    concurrent_manager.results[server] = {}
+                end
+                concurrent_manager.results[server][i] = {
+                    server = server,
+                    error = "无法生成请求参数",
+                    data = nil,
+                    index = i
+                }
+            end
+        end
+    end
+
+    -- 如果没有需要请求的服务器，直接返回
+    if request_count == 0 then
+        if callback then callback(all_results) end
+        return
+    end
+
+    local callback_executed = false
+
+    concurrent_manager:wait_all(function()
+        if callback_executed then
+            return
+        end
+        callback_executed = true
+
+        -- 处理 dandanplay 服务器的结果
+        for server, server_results in pairs(concurrent_manager.results) do
+            for key, result in pairs(server_results) do
+                if result.success and result.animes then
+                    local matches = process_anime_matches(result.animes, current_title, current_season, server)
                     all_results[server] = {
-                        matches = {},
+                        matches = matches,
                         match_type = "anime",
                         danmaku_counts = {},
                         from_cache = false
                     }
-                    process_results()
-                end
-            else
-                local hash = nil
-                local file_info = utils.file_info(file_path)
-                if file_info and file_info.size > 16 * 1024 * 1024 then
-                    local file, err = io.open(normalize(file_path), 'rb')
-                    if file and not err then
-                        local m = MD5.new()
-                        for _ = 1, 16 * 1024 do
-                            local content = file:read(1024)
-                            if not content then break end
-                            m:update(content)
-                        end
-                        file:close()
-                        hash = m:finish()
-                    end
-                end
-
-                local title, season_num, episode_num = parse_title()
-                if title and episode_num then
-                    if season_num then
-                        file_name = title .. " S" .. season_num .. "E" .. episode_num
-                    else
-                        file_name = title .. " E" .. episode_num
-                    end
-                else
-                    file_name = title or file_name
-                end
-
-                local endpoint = "/api/v2/match"
-                local body = {
-                    fileName   = file_name,
-                    fileHash   = hash or "a1b2c3d4e5f67890abcd1234ef567890",
-                    matchMode  = hash and "hashAndFileName" or "fileNameOnly"
-                }
-                local url = server .. endpoint
-                local args = make_danmaku_request_args("POST", url, {
-                    ["Content-Type"] = "application/json"
-                }, body)
-
-                if args then
-                    call_cmd_async(args, function(error, json)
-                        local matches = {}
-                        if not error and json then
-                            local success, parsed = pcall(utils.parse_json, json)
-                            if success and parsed and parsed.matches then
-                                for _, match in ipairs(parsed.matches) do
-                                    -- 从episodeId计算episodeNumber（如果缺失）
-                                    local ep_num = match.episodeNumber
-                                    if not ep_num and match.episodeId then
-                                        ep_num = tonumber(match.episodeId) % 1000
-                                    end
-
-                                    table.insert(matches, {
-                                        animeTitle = match.animeTitle,
-                                        episodeTitle = match.episodeTitle,
-                                        episodeId = match.episodeId,
-                                        episodeNumber = ep_num,
-                                        match_type = "file"
-                                    })
-                                end
-                            end
-                        end
-
-                        -- 异步获取弹幕数
-                        local danmaku_counts = {}
-                        local count_requests = 0
-                        local total_matches = #matches
-
-                        if total_matches == 0 then
-                            all_results[server] = {
-                                matches = matches,
-                                match_type = "file",
-                                danmaku_counts = {},
-                                from_cache = false
-                            }
-                            save_match_to_cache(file_path, file_name, server, matches, "file", {})
-                            process_results()
-                        else
-                            for i, match in ipairs(matches) do
-                                if match.episodeId then
-                                    -- 将episodeId转换为string作为key
-                                    local episode_id_str = tostring(match.episodeId)
-                                    get_danmaku_count(match.episodeId, server, function(count)
-                                        danmaku_counts[episode_id_str] = count
-                                        count_requests = count_requests + 1
-                                        if count_requests == total_matches then
-                                            all_results[server] = {
-                                                matches = matches,
-                                                match_type = "file",
-                                                danmaku_counts = danmaku_counts,
-                                                from_cache = false
-                                            }
-                                            save_match_to_cache(file_path, file_name, server, matches, "file", danmaku_counts)
-                                            process_results()
-                                        end
-                                    end)
-                                else
-                                    count_requests = count_requests + 1
-                                    if count_requests == total_matches then
-                                        all_results[server] = {
-                                            matches = matches,
-                                            match_type = "file",
-                                            danmaku_counts = danmaku_counts,
-                                            from_cache = false
-                                        }
-                                        save_match_to_cache(file_path, file_name, server, matches, "file", danmaku_counts)
-                                        process_results()
-                                    end
-                                end
-                            end
-                        end
-                    end)
-                else
-                    all_results[server] = {
-                        matches = {},
-                        match_type = "file",
-                        danmaku_counts = {},
-                        from_cache = false
-                    }
-                    process_results()
+                    save_match_to_cache(server, matches, "anime", {}, false, update_current_server)
                 end
             end
         end
+
+        -- 处理非 dandanplay 服务器的结果
+        local results = {}
+        for server, server_results in pairs(concurrent_manager.results) do
+            for i, result in pairs(server_results) do
+                if result.server and result.server:find("api%.dandanplay%.") == nil then
+                    table.insert(results, result)
+                end
+            end
+        end
+
+        table.sort(results, function(a, b)
+            return a.index < b.index
+        end)
+
+        local file_match_results = process_file_match_results(results, current_title, other_servers)
+        for server, result in pairs(file_match_results) do
+            all_results[server] = result
+            -- 保存到缓存
+            save_match_to_cache(server, result.matches, "episode", {}, false, update_current_server)
+        end
+
+        if callback then callback(all_results) end
+    end)
+end
+
+function save_selected_episode_with_offset(server, animeTitle, episodeTitle, episodeId, bangumiId)
+    local current_title, current_season, current_episode = parse_title()
+    current_episode = tonumber(current_episode) or 1
+
+    -- 从剧集标题中提取集数
+    local selected_episode_num = get_episode_number (episodeTitle)
+
+    -- 计算相对偏移
+    local episode_offset = nil
+    if selected_episode_num then
+        episode_offset = selected_episode_num - current_episode
+        msg.verbose(string.format("计算集数偏移: 选择集数=%d, 当前集数=%d, 偏移=%d",
+            selected_episode_num, current_episode, episode_offset))
+    else
+        msg.verbose("无法从剧集标题中提取集数，使用固定偏移0")
+        episode_offset = 0
     end
+
+    -- 保存选择记录
+    current_menu_state.selected_episode = {
+        server = server,
+        animeTitle = animeTitle,
+        episodeId = tonumber(episodeId),
+        episodeTitle = episodeTitle,
+        episodeNumber = selected_episode_num,
+        base_episode = current_episode,  -- 选择时的基础集数
+        episode_offset = episode_offset,  -- 相对偏移
+        bangumiId = bangumiId,
+        timestamp = os.time()
+    }
+
+    msg.info(string.format("✅ 记录选择: %s - %s (偏移: %+d)",
+        animeTitle, episodeTitle, episode_offset or 0))
+end
+
+local function get_current_selected_episode_number()
+    if not current_menu_state.selected_episode then
+        return nil
+    end
+
+    local selection = current_menu_state.selected_episode
+    local current_title, current_season, current_episode = parse_title()
+    current_episode = tonumber(current_episode) or 1
+
+    -- 使用偏移计算当前应该选择的集数
+    if selection.episode_offset then
+        local target_episode = current_episode + selection.episode_offset
+        msg.verbose(string.format("动态计算选择集数: 当前=%d, 偏移=%d, 目标=%d",
+            current_episode, selection.episode_offset, target_episode))
+        return target_episode
+    end
+
+    -- 如果没有偏移，使用原始选择的集数
+    return selection.episodeNumber
 end
 
 -- 构建菜单项的函数
@@ -1369,7 +1711,11 @@ local function build_menu_items(all_results, servers, show_refresh)
                 end
 
                 if result.match_type == "anime" then
-                    match_title = "  └─ " .. (match.animeTitle or "未知")
+                    -- 标记相似度最高的结果（第一个结果且相似度>0.5）
+                    local is_best_match = (#result.matches > 0 and result.matches[1] == match) and
+                                         (match.similarity and match.similarity > 0.5)
+                    local prefix = is_best_match and "⭐ " or "  └─ "
+                    match_title = prefix .. (match.animeTitle or "未知")
                     -- 显示集数信息（从当前文件解析）
                     local hint_parts = {}
                     if current_episode_num then
@@ -1377,6 +1723,11 @@ local function build_menu_items(all_results, servers, show_refresh)
                     end
                     if match.typeDescription then
                         table.insert(hint_parts, match.typeDescription)
+                    end
+                    -- 显示相似度
+                    if match.similarity then
+                        local similarity_percent = math.floor(match.similarity * 100)
+                        table.insert(hint_parts, "相似度:" .. similarity_percent .. "%")
                     end
                     match_hint = table.concat(hint_parts, " | ")
                     if danmaku_count > 0 then
@@ -1424,18 +1775,208 @@ local function build_menu_items(all_results, servers, show_refresh)
     return items
 end
 
+-- 构建菜单项的函数（支持展开的剧集列表）
+local function build_menu_items_with_expanded(all_results, servers, show_refresh, expanded_key, current_server)
+    local items = {}
+    local expanded_server, expanded_anime = nil, nil
+    if expanded_key then
+        expanded_server, expanded_anime = expanded_key:match("^(.+)|(.+)$")
+    end
+
+    -- 添加刷新按钮
+    if show_refresh then
+        table.insert(items, {
+            title = "🔄 刷新匹配结果",
+            hint = "清除缓存并重新加载",
+            value = {
+                "script-message-to",
+                mp.get_script_name(),
+                "refresh-danmaku-matches"
+            },
+            keep_open = false,
+            selectable = true,
+        })
+        table.insert(items, {
+            title = "",
+            italic = true,
+            keep_open = true,
+            selectable = false,
+        })
+    end
+
+    for _, server in ipairs(servers) do
+        local result = all_results[server]
+        local server_id = extract_server_identifier(server)
+        local match_count = result and #result.matches or 0
+
+        -- 创建服务器项（不可选择，仅作为标题）
+        table.insert(items, {
+            title = "━━━ " .. server_id .. " (" .. match_count .. "个匹配) ━━━",
+            hint = server,
+            italic = true,
+            keep_open = true,
+            selectable = false,
+        })
+
+        -- 添加匹配结果作为可选项
+        if result and result.matches and #result.matches > 0 then
+            -- 获取当前文件的集数
+            local _, _, current_episode_num = parse_title()
+
+            for _, match in ipairs(result.matches) do
+                local match_title = ""
+                local match_hint = ""
+                local danmaku_count = 0
+
+                -- 获取弹幕数（episodeId需要转换为string）
+                if result.danmaku_counts and match.episodeId then
+                    local episode_id_str = tostring(match.episodeId)
+                    danmaku_count = result.danmaku_counts[episode_id_str] or 0
+                end
+
+                -- 标记当前选中的服务器结果
+                local is_current_server = (server == current_server)
+
+                if result.match_type == "anime" then
+                    local prefix = is_current_server and "⭐ " or "  └─ "
+                    match_title = prefix .. (match.animeTitle or "未知")
+                    -- 显示集数信息（从当前文件解析）
+                    local hint_parts = {}
+                    if current_episode_num then
+                        table.insert(hint_parts, "第" .. current_episode_num .. "集")
+                    end
+                    if match.typeDescription then
+                        table.insert(hint_parts, match.typeDescription)
+                    end
+                    -- 显示相似度
+                    if match.similarity then
+                        local similarity_percent = math.floor(match.similarity * 100)
+                        table.insert(hint_parts, "相似度:" .. similarity_percent .. "%")
+                    end
+                    match_hint = table.concat(hint_parts, " | ")
+                    if danmaku_count > 0 then
+                        match_hint = match_hint .. (match_hint ~= "" and " | " or "") .. danmaku_count .. "条弹幕"
+                    end
+                else
+                    -- 优先使用当前文件的集数，如果没有则使用匹配结果的episodeNumber
+                    local ep_num = current_episode_num or match.episodeNumber
+                    if not ep_num and match.episodeId then
+                        ep_num = tonumber(match.episodeId) % 1000
+                    end
+
+                    local prefix = is_current_server and "⭐ " or "  └─ "
+                    match_title = prefix .. (match.animeTitle or "未知") .. " - " .. (match.episodeTitle or "未知")
+                    match_hint = "第" .. (ep_num or "?") .. "集"
+                    if danmaku_count > 0 then
+                        match_hint = match_hint .. " | " .. danmaku_count .. "条弹幕"
+                    end
+                end
+
+                table.insert(items, {
+                    title = match_title,
+                    hint = match_hint,
+                    value = {
+                        "script-message-to",
+                        mp.get_script_name(),
+                        "switch-danmaku-source",
+                        server,
+                        result.match_type,
+                        utils.format_json(match)
+                    },
+                    keep_open = false,
+                    selectable = true,
+                })
+
+                -- 为所有匹配结果添加"手动选择集数"按钮
+                if match.animeTitle then
+                    local bangumi_id = match.bangumiId or match.animeId
+                    local key = server .. "|" .. match.animeTitle
+                    local is_expanded = expanded_key == key
+
+                    if bangumi_id then
+                        -- 已有bangumiId，直接可以获取剧集列表
+                        table.insert(items, {
+                            title = is_expanded and "      ↳ 收起剧集列表" or "      ↳ 手动选择该番剧集数",
+                            hint = is_expanded and "点击收起" or "展开剧集列表",
+                            value = {
+                                "script-message-to",
+                                mp.get_script_name(),
+                                is_expanded and "collapse-episodes-menu" or "expand-episodes-menu",
+                                server,
+                                tostring(bangumi_id),  -- 确保转换为字符串
+                                match.animeTitle or "未知标题",
+                                utils.format_json(match)
+                            },
+                            keep_open = true,
+                            selectable = true,
+                        })
+                    else
+                        -- 没有bangumiId，需要先搜索获取（针对非dandanplay API）
+                        table.insert(items, {
+                            title = is_expanded and "      ↳ 收起剧集列表" or "      ↳ 手动选择该番剧集数",
+                            hint = is_expanded and "点击收起" or "搜索并展开剧集列表",
+                            value = {
+                                "script-message-to",
+                                mp.get_script_name(),
+                                is_expanded and "collapse-episodes-menu" or "search-and-expand-episodes",
+                                server,
+                                match.animeTitle or "未知标题",
+                                utils.format_json(match)
+                            },
+                            keep_open = true,
+                            selectable = true,
+                        })
+                    end
+
+                    -- 如果已展开，显示剧集列表
+                    if is_expanded and current_menu_state.episodes then
+                        for _, episode in ipairs(current_menu_state.episodes) do
+                            local ep_title = episode.episodeTitle or "未知标题"
+                            local ep_num = episode.episodeNumber or "?"
+                            local is_current = episode.is_current
+
+                            local display_title = "        └─ " .. ep_title
+                            if is_current then
+                                display_title = "        ⭐ " .. ep_title
+                            end
+
+                            table.insert(items, {
+                                title = display_title,
+                                hint = "第" .. ep_num .. "集" .. (is_current and " (当前)" or ""),
+                                value = {
+                                    "script-message-to",
+                                    mp.get_script_name(),
+                                    "load-danmaku",
+                                    match.animeTitle,
+                                    ep_title,
+                                    tostring(episode.episodeId),  -- 确保转换为字符串
+                                    server,
+                                    tostring(bangumi_id)  -- 确保转换为字符串
+                                },
+                                keep_open = false,
+                                selectable = true,
+                            })
+                        end
+                    end
+                end
+            end
+        else
+            table.insert(items, {
+                title = "  └─ 无匹配结果",
+                italic = true,
+                keep_open = true,
+                selectable = false,
+            })
+        end
+    end
+
+    return items
+end
+
 -- 打开弹幕源选择菜单
 function open_danmaku_source_menu(force_refresh)
     if not uosc_available then
         show_message("无uosc UI框架，不支持使用该功能", 2)
-        return
-    end
-
-    local path = mp.get_property("path")
-    local file_name = mp.get_property("filename/no-ext")
-
-    if not path or not file_name then
-        show_message("无法获取文件信息", 2)
         return
     end
 
@@ -1448,67 +1989,73 @@ function open_danmaku_source_menu(force_refresh)
         items = items,
     }
 
-    -- 如果强制刷新，清除缓存
+    local current_server = get_current_server_from_cache()
+
+    -- 如果强制刷新，清除缓存和菜单状态
     if force_refresh then
-        local cache_key = get_cache_key(path, file_name)
+        local cache_key = get_cache_key()
         if MATCH_CACHE[cache_key] then
             MATCH_CACHE[cache_key] = nil
             save_match_cache()
             msg.info("已清除缓存，重新加载匹配结果")
+            current_server = nil
         end
+        current_menu_state.all_results = nil
     end
 
-    -- 先尝试从缓存加载
+    -- 检查缓存中是否有数据
+    local has_cached_data = false
     local cached_results = {}
-    local has_cached = false
     for _, server in ipairs(servers) do
-        local cached_matches, cached_type, cached_counts = get_match_from_cache(path, file_name, server)
-        if cached_matches then
+        local cached_matches, cached_type, cached_counts = get_match_from_cache(server)
+        if cached_matches and #cached_matches > 0 then
             cached_results[server] = {
                 matches = cached_matches,
                 match_type = cached_type,
                 danmaku_counts = cached_counts or {},
                 from_cache = true
             }
-            has_cached = true
+            has_cached_data = true
         end
     end
 
-    -- 如果有缓存，立即显示
-    if has_cached and not force_refresh then
-        items = build_menu_items(cached_results, servers, true)
+    -- 优先使用 current_menu_state 中的数据（如果存在且是当前文件的数据）
+    local use_menu_state = false
+    if current_menu_state.all_results and current_menu_state.servers and
+       not force_refresh then
+        -- 菜单状态存在，直接使用
+        use_menu_state = true
+    end
+
+    if use_menu_state then
+        -- 使用菜单状态中的数据
+        items = build_menu_items_with_expanded(current_menu_state.all_results, servers, true, current_menu_state.expanded_key, current_server)
+        menu_props.items = items
+        local json_props = utils.format_json(menu_props)
+        mp.commandv("script-message-to", "uosc", "open-menu", json_props)
+        return
+    end
+
+    -- 如果有缓存数据且不是强制刷新，直接显示缓存数据
+    if has_cached_data and not force_refresh then
+        -- 保存菜单状态
+        current_menu_state.all_results = cached_results
+        current_menu_state.servers = servers
+        current_menu_state.expanded_key = nil
+        current_menu_state.episodes = nil
+
+        items = build_menu_items_with_expanded(cached_results, servers, true, nil, current_server)
         menu_props.items = items
         local json_props = utils.format_json(menu_props)
         mp.commandv("script-message-to", "uosc", "open-menu", json_props)
 
-        -- 在后台更新缓存（如果有新数据）
-        get_all_servers_matches(path, file_name, function(all_results)
-            -- 检查是否有更新
-            local has_update = false
-            for _, server in ipairs(servers) do
-                local cached = cached_results[server]
-                local fresh = all_results[server]
-                if fresh and cached then
-                    if #fresh.matches ~= #cached.matches then
-                        has_update = true
-                        break
-                    end
-                elseif fresh and not cached then
-                    has_update = true
-                    break
-                end
-            end
+        -- 不再进行后台更新，直接使用缓存数据
+        msg.verbose("使用缓存数据，跳过后台更新")
+        return
+    end
 
-            -- 如果有更新，刷新菜单
-            if has_update then
-                items = build_menu_items(all_results, servers, true)
-                menu_props.items = items
-                json_props = utils.format_json(menu_props)
-                mp.commandv("script-message-to", "uosc", "update-menu", json_props)
-            end
-        end)
-    else
-        -- 没有缓存或强制刷新，显示加载提示
+    -- 没有缓存数据或强制刷新，显示加载提示并获取数据
+    if not has_cached_data or force_refresh then
         table.insert(items, {
             title = "正在加载匹配结果...",
             italic = true,
@@ -1520,8 +2067,16 @@ function open_danmaku_source_menu(force_refresh)
         mp.commandv("script-message-to", "uosc", "open-menu", json_props)
 
         -- 获取所有服务器的匹配结果
+        local path = mp.get_property("path")
+        local file_name = mp.get_property("filename/no-ext")
         get_all_servers_matches(path, file_name, function(all_results)
-            items = build_menu_items(all_results, servers, true)
+            -- 保存菜单状态
+            current_menu_state.all_results = all_results
+            current_menu_state.servers = servers
+            current_menu_state.expanded_key = nil
+            current_menu_state.episodes = nil
+
+            items = build_menu_items_with_expanded(all_results, servers, true, nil, current_server)
 
             -- 更新菜单
             menu_props.items = items
@@ -1574,6 +2129,28 @@ mp.register_script_message("switch-danmaku-source", function(server, match_type,
                                 DANMAKU.episode = target_episode.episodeTitle or "未知标题"
                                 set_episode_id(target_episode.episodeId, server, true)
                                 msg.info("✅ 匹配成功: " .. DANMAKU.anime .. " 第" .. episode_num .. "集")
+
+                                -- 更新缓存
+                                if server then
+                                    local cache_match = {
+                                        animeTitle = DANMAKU.anime,
+                                        episodeTitle = DANMAKU.episode,
+                                        episodeId = target_episode.episodeId,
+                                        bangumiId = match.bangumiId,
+                                        match_type = "episode",
+                                        similarity = 1.0
+                                    }
+                                    save_match_to_cache(server, {cache_match}, "episode", {}, true)
+
+                                    -- 更新菜单状态
+                                    if current_menu_state.all_results then
+                                        if not current_menu_state.all_results[server] then
+                                            current_menu_state.all_results[server] = {}
+                                        end
+                                        current_menu_state.all_results[server].matches = {cache_match}
+                                        current_menu_state.all_results[server].match_type = "episode"
+                                    end
+                                end
                             else
                                 msg.warn("未找到对应集数: 第" .. episode_num .. "集 (总共" .. #episodes .. "集)")
                                 show_message("未找到对应集数: 第" .. episode_num .. "集", 3)
@@ -1612,6 +2189,19 @@ mp.register_script_message("switch-danmaku-source", function(server, match_type,
         DANMAKU.episode = match.episodeTitle
         if match.episodeId then
             set_episode_id(match.episodeId, server, true)
+            -- 更新缓存
+            if server then
+                save_match_to_cache(server, {match}, "episode", {}, true)
+
+                -- 更新菜单状态
+                if current_menu_state.all_results then
+                    if not current_menu_state.all_results[server] then
+                        current_menu_state.all_results[server] = {}
+                    end
+                    current_menu_state.all_results[server].matches = {match}
+                    current_menu_state.all_results[server].match_type = "episode"
+                end
+            end
         end
     end
 
@@ -1644,17 +2234,272 @@ mp.register_script_message("auto_load_danmaku_matches", function()
     if not uosc_available then
         return
     end
+    local cache_key = get_cache_key()
 
+    -- 检查是否已经有缓存数据
+    local has_cached_data = false
+    local servers = get_api_servers()
+
+    for _, server in ipairs(servers) do
+        local cached_matches, cached_type, cached_counts = get_match_from_cache(server)
+        if cached_matches and #cached_matches > 0 then
+            has_cached_data = true
+            break
+        end
+    end
+
+    -- 如果已经有缓存数据，直接使用缓存更新菜单状态，不重新加载
+    if has_cached_data then
+        msg.verbose("已有缓存数据，跳过自动加载")
+        return
+    end
     local path = mp.get_property("path")
     local file_name = mp.get_property("filename/no-ext")
 
-    if not path or not file_name or is_protocol(path) then
-        return
-    end
-
-    -- 在后台静默加载匹配结果到缓存
+    -- 在后台静默加载匹配结果到缓存，并更新菜单状态
     get_all_servers_matches(path, file_name, function(all_results)
+        -- 更新菜单状态，这样打开菜单时就能显示最新的结果
+        current_menu_state.all_results = all_results
+        current_menu_state.servers = get_api_servers()
+        current_menu_state.expanded_key = nil
+        current_menu_state.episodes = nil
+
         -- 匹配结果已自动保存到缓存
         msg.verbose("自动加载匹配结果完成，共 " .. #get_api_servers() .. " 个服务器")
     end)
+end)
+
+-- 在当前菜单中展开剧集列表
+local function expand_episodes_in_menu(server, bangumiId, animeTitle, match_json)
+    local endpoint = "/api/v2/bangumi/" .. bangumiId
+    local url = server .. endpoint
+    local args = make_danmaku_request_args("GET", url, nil, nil)
+
+    if not args then
+        show_message("无法生成请求参数", 3)
+        return
+    end
+
+    -- 获取当前文件的集数
+    local _, _, current_episode_num = parse_title()
+    current_episode_num = tonumber(current_episode_num)
+
+    -- 显示加载提示
+    if current_menu_state.all_results and current_menu_state.servers then
+        local current_server = get_current_server_from_cache()
+        local loading_items = build_menu_items_with_expanded(
+            current_menu_state.all_results,
+            current_menu_state.servers,
+            true,
+            server .. "|" .. animeTitle,
+            current_server
+        )
+        -- 在展开按钮后添加加载提示
+        for i, item in ipairs(loading_items) do
+            if item.title and item.title:find("手动选择该番剧集数", 1, true) then
+                table.insert(loading_items, i + 1, {
+                    title = "        ⏳ 加载剧集列表中...",
+                    italic = true,
+                    keep_open = true,
+                    selectable = false,
+                })
+                break
+            end
+        end
+        local menu_props = {
+            type = "menu_danmaku_source",
+            title = "选择弹幕源",
+            search_style = "disabled",
+            items = loading_items,
+        }
+        local json_props = utils.format_json(menu_props)
+        mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+    end
+
+    call_cmd_async(args, function(error, json)
+        if error or not json then
+            show_message("获取剧集列表失败: " .. (error or "未知错误"), 3)
+            return
+        end
+
+        local success, parsed = pcall(utils.parse_json, json)
+        if not success or not parsed or not parsed.bangumi or not parsed.bangumi.episodes then
+            show_message("获取剧集列表失败: 数据格式错误", 3)
+            return
+        end
+
+        local episodes = parsed.bangumi.episodes
+
+        -- 按剧集号排序
+        table.sort(episodes, function(a, b)
+            return (tonumber(a.episodeNumber) or 0) < (tonumber(b.episodeNumber) or 0)
+        end)
+
+        local dynamic_selected_episode = get_current_selected_episode_number()
+        -- 标记当前集数（如果存在）
+        for _, episode in ipairs(episodes) do
+            local ep_num = tonumber(episode.episodeNumber)
+            episode.is_current = false
+            if dynamic_selected_episode and ep_num and ep_num == dynamic_selected_episode then
+                episode.is_current = true
+            end
+            if current_episode_num and ep_num == current_episode_num then
+                episode.is_current = true
+            end
+
+            -- 检查集数标题中是否包含当前集数
+            if current_episode_num and episode.episodeTitle and not episode.is_current then
+                local title_ep_num = get_episode_number(episode.episodeTitle)
+                if title_ep_num and tonumber(title_ep_num) == current_episode_num then
+                    episode.is_current = true
+                end
+            end
+        end
+
+        -- 保存展开状态
+        current_menu_state.episodes = episodes
+        current_menu_state.expanded_key = server .. "|" .. animeTitle
+
+        -- 更新菜单
+        if current_menu_state.all_results and current_menu_state.servers then
+            local current_server = get_current_server_from_cache()
+            local items = build_menu_items_with_expanded(
+                current_menu_state.all_results,
+                current_menu_state.servers,
+                true,
+                current_menu_state.expanded_key,
+                current_server
+            )
+            local menu_props = {
+                type = "menu_danmaku_source",
+                title = "选择弹幕源",
+                search_style = "disabled",
+                items = items,
+            }
+            local json_props = utils.format_json(menu_props)
+            mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+        end
+    end)
+end
+
+-- 搜索并展开剧集列表（针对非dandanplay API）
+mp.register_script_message("search-and-expand-episodes", function(server, animeTitle, match_json)
+    if not uosc_available then
+        show_message("无uosc UI框架，不支持使用该功能", 2)
+        return
+    end
+
+    local match = utils.parse_json(match_json)
+    if not match then
+        show_message("解析匹配结果失败", 2)
+        return
+    end
+
+    -- 先搜索获取bangumiId
+    local encoded_query = url_encode(animeTitle)
+    local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
+    local url = server .. endpoint
+    local args = make_danmaku_request_args("GET", url, nil, nil)
+
+    if not args then
+        show_message("无法生成请求参数", 3)
+        return
+    end
+
+    -- 显示加载提示
+    if current_menu_state.all_results and current_menu_state.servers then
+        local current_server = get_current_server_from_cache()
+        local loading_items = build_menu_items_with_expanded(
+            current_menu_state.all_results,
+            current_menu_state.servers,
+            true,
+            server .. "|" .. animeTitle,
+            current_server
+        )
+        -- 在展开按钮后添加加载提示
+        for i, item in ipairs(loading_items) do
+            if item.title and item.title:find("手动选择该番剧集数", 1, true) then
+                table.insert(loading_items, i + 1, {
+                    title = "        ⏳ 搜索番剧信息中...",
+                    italic = true,
+                    keep_open = true,
+                    selectable = false,
+                })
+                break
+            end
+        end
+        local menu_props = {
+            type = "menu_danmaku_source",
+            title = "选择弹幕源",
+            search_style = "disabled",
+            items = loading_items,
+        }
+        local json_props = utils.format_json(menu_props)
+        mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+    end
+
+    call_cmd_async(args, function(error, json)
+        if error or not json then
+            show_message("搜索番剧失败: " .. (error or "未知错误"), 3)
+            return
+        end
+
+        local success, parsed = pcall(utils.parse_json, json)
+        if not success or not parsed or not parsed.animes or #parsed.animes == 0 then
+            show_message("未找到匹配的番剧", 3)
+            return
+        end
+
+        -- 使用第一个搜索结果
+        local first_result = parsed.animes[1]
+        local bangumiId = first_result.bangumiId or first_result.animeId
+        if not bangumiId then
+            show_message("未找到番剧ID", 3)
+            return
+        end
+
+        -- 展开剧集列表
+        expand_episodes_in_menu(server, tostring(bangumiId), animeTitle, match_json)
+    end)
+end)
+
+-- 直接展开剧集列表
+mp.register_script_message("expand-episodes-menu", function(server, bangumiId, animeTitle, match_json)
+    if not uosc_available then
+        show_message("无uosc UI框架，不支持使用该功能", 2)
+        return
+    end
+
+    expand_episodes_in_menu(server, bangumiId, animeTitle, match_json)
+end)
+
+-- 收起剧集列表
+mp.register_script_message("collapse-episodes-menu", function()
+    if not uosc_available then
+        return
+    end
+
+    -- 清除展开状态
+    current_menu_state.expanded_key = nil
+    current_menu_state.episodes = nil
+
+    -- 更新菜单
+    if current_menu_state.all_results and current_menu_state.servers then
+        local current_server = get_current_server_from_cache()
+        local items = build_menu_items_with_expanded(
+            current_menu_state.all_results,
+            current_menu_state.servers,
+            true,
+            nil,
+            current_server
+        )
+        local menu_props = {
+            type = "menu_danmaku_source",
+            title = "选择弹幕源",
+            search_style = "disabled",
+            items = items,
+        }
+        local json_props = utils.format_json(menu_props)
+        mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+    end
 end)

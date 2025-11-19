@@ -342,6 +342,10 @@ function contains_any(tab, val)
     return false
 end
 
+function string.startswith(str, start)
+    return str:sub(1, #start) == start
+end
+
 --读history 和 写history
 function read_file(file_path)
     local file = io.open(file_path, "r") -- 打开文件，"r"表示只读模式
@@ -602,7 +606,7 @@ function extract_season(title)
         end
     end
 
-    return 0
+    return 1
 end
 
 

@@ -289,18 +289,21 @@ function make_danmaku_request_args(method, url, headers, body)
 end
 
 -- 尝试通过解析文件名匹配剧集
-local function match_episode(animeTitle, bangumiId, episode_num, target_server)
+function match_episode(animeTitle, bangumiId, episode_num, target_server, callback)
+    callback = callback or function(error) 
+        if error then msg.error(error) end
+    end
+    
     local servers = target_server and {target_server} or get_api_servers()
     local endpoint = "/api/v2/bangumi/" .. bangumiId
 
     local concurrent_manager = ConcurrentManager:new()
     local total_servers = #servers
-    local has_valid_response = false
-    local selected_result = nil
+    
     for i, server in ipairs(servers) do
         local url = server .. endpoint
         local args = make_danmaku_request_args("GET", url)
-        msg.info("尝试获取番剧信息: " .. url)
+        msg.verbose("尝试获取番剧信息: " .. url)
 
         if args then
             concurrent_manager:start_request(server, i, function(cb)
@@ -339,12 +342,14 @@ local function match_episode(animeTitle, bangumiId, episode_num, target_server)
     end
 
     concurrent_manager:wait_all(function()
+        local selected_result = nil
+        local has_valid_response = false
+
         for server, server_results in pairs(concurrent_manager.results) do
             for i, result in pairs(server_results) do
                 if result and result.success and result.data and result.data.bangumi and result.data.bangumi.episodes then
                     selected_result = result
                     has_valid_response = true
-                    msg.verbose("使用服务器响应: " .. result.server)
                     break
                 end
             end
@@ -356,7 +361,6 @@ local function match_episode(animeTitle, bangumiId, episode_num, target_server)
                 for i, result in pairs(server_results) do
                     if result and result.data then
                         selected_result = result
-                        msg.verbose("回退使用服务器: " .. result.server)
                         break
                     end
                 end
@@ -365,33 +369,61 @@ local function match_episode(animeTitle, bangumiId, episode_num, target_server)
         end
 
         if not selected_result or not selected_result.data or not selected_result.data.bangumi then
+            local error_msg = "获取番剧信息失败: 所有服务器请求失败"
             if selected_result and selected_result.error then
-                msg.error("获取番剧信息失败: " .. selected_result.error)
-            else
-                msg.error("获取番剧信息失败: 所有服务器请求失败")
+                error_msg = "获取番剧信息失败: " .. selected_result.error
             end
+            callback(error_msg)
             return
         end
 
         local data = selected_result.data
         if not data.bangumi or not data.bangumi.episodes then
-            msg.error("番剧数据格式错误")
+            local error_msg = "番剧数据格式错误"
+            callback(error_msg)
             return
         end
 
+        local found = false
         for _, episode in ipairs(data.bangumi.episodes) do
             local ep_num = tonumber(episode.episodeNumber)
             if ep_num and ep_num == tonumber(episode_num) then
                 DANMAKU.anime = animeTitle
                 DANMAKU.episode = episode.episodeTitle
                 set_episode_id(episode.episodeId, selected_result.server)
+                local match = {
+                    animeTitle = animeTitle,
+                    episodeTitle = episode.episodeTitle,
+                    episodeId = episode.episodeId,
+                    bangumiId = bangumiId,
+                    match_type = "episode",
+                    similarity = 1.0
+                }
+                save_match_to_cache(selected_result.server, {match}, "episode", {}, true)
+                found = true
+                callback(nil) -- 成功，无错误
                 break
             end
+        end
+
+        if not found then
+            local error_msg = string.format("没有找到第 %d 集的匹配项，总剧集数: %d", 
+                tonumber(episode_num), #data.bangumi.episodes)
+
+            local available_episodes = {}
+            for _, ep in ipairs(data.bangumi.episodes) do
+                if ep.episodeNumber then
+                    table.insert(available_episodes, tostring(ep.episodeNumber))
+                end
+            end
+            msg.verbose("可用的剧集编号: " .. table.concat(available_episodes, ", "))
+            
+            callback(error_msg)
         end
     end)
 end
 
-local function clean_anime_title(title)
+function clean_anime_title(title)
     local patterns = {
         "%[OVA%]", "%[OAD%]", "%[剧场版%]", "%[Movie%]", "%[電影%]",
         "%[特別篇%]", "%[Special%]", "%[SP%]",
@@ -410,7 +442,7 @@ local function clean_anime_title(title)
     return url_encode(cleaned)
 end
 
-local function query_tmdb_chinese_title(title, class)
+function query_tmdb_chinese_title(title, class)
     -- 确保class是有效的值
     if class == "tvseries" or class == "ova" then
         class = "tv"
@@ -529,6 +561,7 @@ function process_match_result(selected_result, title, callback, forced_match)
     msg.info("   剧集: " .. (DANMAKU.episode or "nil"))
 
     set_episode_id(match.episodeId, server)
+    save_match_to_cache(server, {match}, "episode", {}, true)
 
     callback(nil)
 end
@@ -539,82 +572,20 @@ function process_search_result(result, title, season_num, episode_num, callback)
     local animes = result.data.animes
     local result_server = result.server
 
-    local filtered_animes = {}
-    local anime_type = "tvseries"
-    local lower_title = title:lower()
-
-    if lower_title:match("ova") or lower_title:match("oad") then
-        anime_type = "ova"
-    elseif lower_title:match("剧场版") or lower_title:match("movie") or lower_title:match("劇場版") then
-        anime_type = "movie"
-    end
-
-    local function filter_by_type(animes, t)
-        local result = {}
-        for _, a in ipairs(animes) do
-            if a.type == t or (t == "tvseries" and (a.type == "jpdrama")) then
-                table.insert(result, a)
-            end
-        end
-        return result
-    end
-
-    filtered_animes = filter_by_type(animes, anime_type)
-    if #filtered_animes == 0 and anime_type == "tvseries" and not season_num then
-        filtered_animes = filter_by_type(animes, "movie")
-    end
-
-    msg.info("过滤后动画数量: " .. #filtered_animes .. " (类型: " .. anime_type .. ")")
-
-    local best_match, best_score = nil, -1
-    if #filtered_animes == 1 then
-        best_match = filtered_animes[1]
-        best_score = 1
-    elseif #filtered_animes > 1 then
-        local base_title = title:gsub("%s*%(%d+%)", ""):gsub("^%s*(.-)%s*$", "%1")
-        local target_title = base_title
-        if is_english(base_title) then
-            local chinese_title = query_tmdb_chinese_title(base_title, anime_type)
-            if chinese_title then
-                base_title = chinese_title
-                msg.info("成功获取中文标题: " .. chinese_title)
+    local matches = process_anime_matches(animes, title, season_num, result_server)
+    if matches and #matches > 0 then
+        local best_match = matches[1]
+        msg.info("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_match.similarity or 0) .. ", 服务器: " .. result_server .. ")")
+        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server, function(error)
+            if error then
+                msg.warn("match_episode 失败: " .. error)
+                if callback then callback("match_episode 失败: " .. error) end
             else
-                msg.info("无法获取中文标题，使用原英文标题: " .. base_title)
+                if callback then callback(nil) end
             end
-        end
-
-        if tonumber(season_num) > 1 then
-            target_title = base_title .. " 第" .. number_to_chinese(season_num) .. "季"
-        else
-            target_title = base_title .. " 第一季"
-        end
-
-        msg.info("目标匹配标题: " .. target_title)
-        msg.info("数据来源服务器: " .. result_server)
-
-        for _, anime in ipairs(filtered_animes) do
-            local anime_title = anime.animeTitle or ""
-            local score = jaro_winkler(target_title, anime_title)
-            local anime_season = extract_season(anime_title)
-            if tonumber(season_num) > 0 and anime_season ~= tonumber(season_num) then
-                score = score - 0.2
-            end
-            msg.info("候选: " .. anime_title .. " -> 相似度 " .. string.format("%.3f", score))
-
-            if score > best_score then
-                best_score = score
-                best_match = anime
-            end
-        end
-    end
-
-    local threshold = 0.75
-    if best_match and best_score >= threshold and not best_match.animeTitle:find("搜索正在") then
-        msg.info("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_score) .. ", 服务器: " .. result_server .. ")")
-        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server)
-        if callback then callback(nil) end
+        end)
     else
-        msg.warn("anime_match 没有找到相似度 >= " .. threshold)
+        msg.warn("anime_match 没有找到相似度 >= 0.75")
         if callback then callback("anime_match 相似度不足") end
     end
 end
