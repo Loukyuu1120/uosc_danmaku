@@ -10,9 +10,9 @@ local current_menu_state = {
     expanded_key = nil,  -- 格式: "server|animeTitle"
     episodes = nil,
     selected_episode = nil, -- 存储手动选择的剧集信息，用于计算当前播放集的偏移
-	search_items = nil,  -- 搜索结果的items数组
-	search_query = nil,  -- 当前搜索关键词
-	search_seen_ids = nil,  -- 已添加的番剧ID集合
+	search_items = nil,  -- 存储手动搜索结果的items数组
+	search_query = nil,  -- 存储手动搜索关键词
+	search_seen_ids = nil,  -- 存储手动搜索的ID集合
 }
 
 local function extract_server_identifier(server_url)
@@ -95,6 +95,14 @@ function get_animes(query)
         end
         return
     end
+
+    -- 定时清理手动搜索缓存 (60秒) ------------------
+    if current_menu_state.timer then current_menu_state.timer:kill() end
+    current_menu_state.timer = mp.add_timeout(60, function()
+        current_menu_state.search_items, current_menu_state.search_query, current_menu_state.search_seen_ids = nil, nil, nil
+        current_menu_state.timer = nil
+        msg.info("搜索缓存已过期自动清理")
+    end)
 
     -- 新搜索：清空之前的缓存
     current_menu_state.search_items = nil
