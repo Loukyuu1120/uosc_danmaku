@@ -67,8 +67,8 @@ function get_animes(query)
         -- 直接使用缓存的结果
         items = current_menu_state.search_items
         
-        -- 移除可能存在的"正在加载"提示
-        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在加载") then
+        -- 移除可能存在的"正在搜索"提示
+        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
             table.remove(items, #items)
         end
         
@@ -117,9 +117,9 @@ function get_animes(query)
         selectable = true,
     })
 
-    -- 添加正在加载提示项
+    -- 添加正在搜索提示项
     table.insert(items, {
-        title = "⏳ 正在加载...(" .. #servers .. "个服务器)",
+        title = "⏳ 正在搜索...(" .. #servers .. "个服务器)",
         italic = true,
         keep_open = true,
         selectable = false,
@@ -258,8 +258,8 @@ function get_animes(query)
         end
         callback_executed = true
 
-        -- 移除"正在加载"提示
-        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在加载") then
+        -- 移除"正在搜索"提示
+        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
             table.remove(items, #items)
         end
 
@@ -2166,7 +2166,7 @@ function open_danmaku_source_menu(force_refresh)
     -- 没有缓存数据或强制刷新，显示加载提示并获取数据
     if not has_cached_data or force_refresh then
         table.insert(items, {
-            title = "正在加载匹配结果...",
+            title = "正在搜索匹配结果...",
             italic = true,
             keep_open = true,
             selectable = false,
@@ -2389,7 +2389,7 @@ local function expand_episodes_in_menu(server, bangumiId, animeTitle, match_json
             true,
             current_menu_state.expanded_key, -- 保持当前的展开状态，直到加载完成
             current_server,
-            loading_key -- 传递正在加载的 key
+            loading_key -- 传递正在搜索的 key
         )
 
         local menu_props = {
