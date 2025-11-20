@@ -10,6 +10,9 @@ local current_menu_state = {
     expanded_key = nil,  -- 格式: "server|animeTitle"
     episodes = nil,
     selected_episode = nil, -- 存储手动选择的剧集信息，用于计算当前播放集的偏移
+	search_items = nil,  -- 搜索结果的items数组
+	search_query = nil,  -- 当前搜索关键词
+	search_seen_ids = nil,  -- 已添加的番剧ID集合
 }
 
 local function extract_server_identifier(server_url)
@@ -56,6 +59,46 @@ function get_animes(query)
     local footnote = "使用enter或ctrl+enter进行搜索"
     local menu_cmd = { "script-message-to", mp.get_script_name(), "search-anime-event" }
 
+    -- 检查是否是相同的搜索且已有结果（从详情页返回的情况）
+    if current_menu_state.search_query == query and 
+       current_menu_state.search_items and 
+       #current_menu_state.search_items > 2 then
+        msg.info("使用缓存的搜索结果，跳过重新搜索")
+        -- 直接使用缓存的结果
+        items = current_menu_state.search_items
+        
+        -- 移除可能存在的"正在加载"提示
+        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在加载") then
+            table.remove(items, #items)
+        end
+        
+        local result_count = #items - 1  -- 减去返回按钮
+        local final_message = "✅ 搜索到 " .. result_count .. " 个结果"
+        
+        if uosc_available then
+            local menu_props = {
+                type = menu_type,
+                title = menu_title,
+                search_style = "palette",
+                search_debounce = "submit",
+                on_search = menu_cmd,
+                footnote = final_message,
+                search_suggestion = query,
+                items = items,
+            }
+            local json_props = utils.format_json(menu_props)
+            mp.commandv("script-message-to", "uosc", "open-menu", json_props)
+        elseif input_loaded then
+            open_menu_select(items)
+        end
+        return
+    end
+
+    -- 新搜索：清空之前的缓存
+    current_menu_state.search_items = nil
+    current_menu_state.search_query = nil
+    current_menu_state.search_seen_ids = nil
+
     -- 添加返回按钮
     table.insert(items, {
         title = "← 返回",
@@ -64,7 +107,7 @@ function get_animes(query)
         selectable = true,
     })
 
-    -- 添加正在加载提示项(在最底部,显示服务器数量)
+    -- 添加正在加载提示项
     table.insert(items, {
         title = "⏳ 正在加载...(" .. #servers .. "个服务器)",
         italic = true,
@@ -87,6 +130,11 @@ function get_animes(query)
     local concurrent_manager = ConcurrentManager:new()
     local request_count = 0  -- 记录实际发起的请求数量
 
+    -- 保存到全局状态
+    current_menu_state.search_items = items
+    current_menu_state.search_query = query
+    current_menu_state.search_seen_ids = seen_anime_ids
+
     -- 渐进式更新菜单的函数
     local function update_menu_incrementally(new_animes, server_name)
         if not new_animes or #new_animes == 0 then
@@ -94,8 +142,6 @@ function get_animes(query)
         end
 
         local added_count = 0
-        -- 计算插入位置:在"正在加载"提示之前
-        local insert_position = #items  -- 最后一项是"正在加载",所以在它之前插入
         
         for _, anime in ipairs(new_animes) do
             local anime_id = anime.bangumiId or anime.animeId
@@ -106,8 +152,8 @@ function get_animes(query)
                     display_title = display_title .. " [" .. server_identifier .. "]"
                 end
                 
-                -- 在"正在加载"之前插入新结果
-                table.insert(items, insert_position + added_count, {
+                -- 插入到倒数第二个位置（加载提示之前）
+                table.insert(items, #items, {
                     title = display_title,
                     hint = anime.typeDescription,
                     value = {
@@ -126,11 +172,22 @@ function get_animes(query)
             end
         end
 
-        -- 立即更新菜单显示(保留加载提示在底部)
         if added_count > 0 and uosc_available then
             local progress_message = string.format("已加载 %d 个结果 (进度: %d/%d)", 
                 total_results, completed_servers, #servers)
-            update_menu_uosc(menu_type, menu_title, items, progress_message, menu_cmd, query)
+            
+            local menu_props = {
+                type = menu_type,
+                title = menu_title,
+                search_style = "palette",
+                search_debounce = "submit",
+                on_search = menu_cmd,
+                footnote = progress_message,
+                search_suggestion = query,
+                items = items,
+            }
+            local json_props = utils.format_json(menu_props)
+            mp.commandv("script-message-to", "uosc", "update-menu", json_props)
         end
     end
 
@@ -191,7 +248,7 @@ function get_animes(query)
         end
         callback_executed = true
 
-        -- 移除"正在加载"提示(现在在最底部,即最后一项)
+        -- 移除"正在加载"提示
         if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在加载") then
             table.remove(items, #items)
         end
@@ -200,7 +257,18 @@ function get_animes(query)
         if total_results > 0 then
             local final_message = "✅ 搜索到 " .. total_results .. " 个结果"
             if uosc_available then
-                update_menu_uosc(menu_type, menu_title, items, final_message, menu_cmd, query)
+                local menu_props = {
+                    type = menu_type,
+                    title = menu_title,
+                    search_style = "palette",
+                    search_debounce = "submit",
+                    on_search = menu_cmd,
+                    footnote = final_message,
+                    search_suggestion = query,
+                    items = items,
+                }
+                local json_props = utils.format_json(menu_props)
+                mp.commandv("script-message-to", "uosc", "update-menu", json_props)
             elseif input_loaded then
                 show_message("", 0)
                 mp.add_timeout(0.1, function()
