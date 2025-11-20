@@ -1,0 +1,31 @@
+name: Auto Zip Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Zip project files
+        run: |
+          FILENAME="${{ github.event.repository.name }}.zip"
+          zip -r "$FILENAME" . -x ".github/*" -x ".git/*"
+          echo "打包完成: $FILENAME"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+          files: ${{ github.event.repository.name }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
