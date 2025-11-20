@@ -62,7 +62,7 @@ function get_animes(query)
     -- 检查是否是相同的搜索且已有结果（从详情页返回的情况）
     if current_menu_state.search_query == query and 
        current_menu_state.search_items and 
-       #current_menu_state.search_items > 2 then
+       #current_menu_state.search_items >= 1 then
         msg.info("使用缓存的搜索结果，跳过重新搜索")
         -- 直接使用缓存的结果
         items = current_menu_state.search_items
@@ -73,7 +73,9 @@ function get_animes(query)
         end
         
         local result_count = #items - 1  -- 减去返回按钮
-        local final_message = "✅ 搜索到 " .. result_count .. " 个结果"
+        local final_message = result_count > 0 
+            and ("✅ 搜索到 " .. result_count .. " 个结果")
+            or "无结果"
         
         if uosc_available then
             local menu_props = {
@@ -276,7 +278,7 @@ function get_animes(query)
                 end)
             end
         else
-            if #items == 1 then -- 只有返回按钮
+            if #items == 1 then
                 local message = "无结果"
                 if uosc_available then
                     update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
