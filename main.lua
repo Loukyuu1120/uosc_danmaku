@@ -1,4 +1,4 @@
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 mp.commandv('script-message', 'uosc_danmaku-version', VERSION)
 
@@ -884,7 +884,7 @@ mp.register_event("file-loaded", function()
     end
 
     -- 在文件加载时自动加载匹配结果（用于弹幕源选择菜单）
-    if uosc_available and path and not is_protocol(path) then
+    if uosc_available and path then
         mp.add_timeout(1.0, function()
             -- 延迟加载，避免影响正常播放
             if ENABLED then
