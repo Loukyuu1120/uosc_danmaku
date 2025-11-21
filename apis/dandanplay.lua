@@ -1,75 +1,6 @@
 local msg = require('mp.msg')
 local utils = require("mp.utils")
 
-------------------------------------------------
--- 并发请求管理器
-------------------------------------------------
-ConcurrentManager = {
-    active_requests = 0,
-    max_concurrent = 6, -- 最大并发数
-    pending_requests = {},
-    results = {},
-    waiting = false
-}
-
-function ConcurrentManager:new()
-    local o = {
-        active_requests = 0,
-        max_concurrent = 6,
-        pending_requests = {},
-        results = {},
-        final_callback = nil,
-        server_results = {}
-    }
-    setmetatable(o, self)
-    self.__index = self
-    return o
-end
-
-function ConcurrentManager:wait_all(callback)
-    self.final_callback = callback
-    self:check_completion()
-end
-
-function ConcurrentManager:check_completion()
-    if self.active_requests == 0 and #self.pending_requests == 0 and self.final_callback then
-        local callback = self.final_callback
-        self.final_callback = nil
-        callback()
-    end
-end
-
-function ConcurrentManager:start_request(server, key, request_func)
-    if self.active_requests >= self.max_concurrent then
-        table.insert(self.pending_requests, {server = server, key = key, func = request_func})
-        return
-    end
-    self:do_request(server, key, request_func)
-end
-
-function ConcurrentManager:do_request(server, key, request_func)
-    self.active_requests = self.active_requests + 1
-    request_func(function(result)
-        if not result.server then
-            result.server = server
-        end
-        result.index = key
-        if not self.results[server] then
-            self.results[server] = {}
-        end
-        self.results[server][key] = result
-
-        self.active_requests = self.active_requests - 1
-
-        if #self.pending_requests > 0 and self.active_requests < self.max_concurrent then
-            local next_request = table.remove(self.pending_requests, 1)
-            self:do_request(next_request.server, next_request.key, next_request.func)
-        end
-
-        self:check_completion()
-    end)
-end
-
 local function extract_url(url)
     local path = url:match("^https?://[^/]+(/[^%?]*)")
     return path
@@ -91,6 +22,35 @@ end
 -- 并发请求多个API服务器
 local function make_concurrent_danmaku_request(servers, request_config, response_handler)
     local concurrent_manager = ConcurrentManager:new()
+    local total_servers = #servers
+
+    -- 定义验证器：判断结果是否“可用”，返回 true，管理器会立即停止等待后续低优先级的请求
+    local function is_valid_result(result)
+        if not result then return false end
+        if result.error then return false end
+        if not result.data then return false end
+        
+        local data = result.data
+
+        -- 情况A: 搜番剧 (data.animes 有内容)
+        if data.animes and #data.animes > 0 then
+            -- 简单的非空检查，如果需要更严谨可以检查 inside attributes
+            return true 
+        end
+
+        -- 情况B: 精确Hash匹配 (data.isMatched = true)
+        if data.isMatched then 
+            return true 
+        end
+
+        -- 情况C: 文件名匹配 (data.matches 有内容)
+        if data.matches and #data.matches > 0 then
+            return true
+        end
+
+        return false
+    end
+
     for i, server in ipairs(servers) do
         local args = request_config.make_args(server, i)
 
@@ -117,26 +77,21 @@ local function make_concurrent_danmaku_request(servers, request_config, response
                 end)
             end)
         else
-            if not concurrent_manager.results[server] then
-                concurrent_manager.results[server] = {}
-            end
-            concurrent_manager.results[server][i] = {
-                server = server,
-                error = "无法生成请求参数",
-                data = nil,
-                index = i
-            }
+            concurrent_manager:start_request(server, i, function(cb)
+                cb({
+                    server = server,
+                    error = "无法生成请求参数",
+                    data = nil,
+                    index = i
+                })
+            end)
         end
     end
 
-    concurrent_manager:wait_all(function()
-        local results = {}
-        for server, server_results in pairs(concurrent_manager.results) do
-            for i, result in pairs(server_results) do
-                table.insert(results, result)
-            end
-        end
-
+    concurrent_manager:wait_priority(total_servers, is_valid_result, function(results)
+        -- results 可能是单个成功结果（快速返回），也可能是所有失败结果的列表
+        
+        -- 确保排序（虽然如果是单个结果排序没意义，但为了兼容性保留）
         table.sort(results, function(a, b)
             return a.index < b.index
         end)

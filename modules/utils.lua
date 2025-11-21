@@ -723,3 +723,130 @@ function call_cmd_async(args, callback)
         mp.abort_async_command(abort_signal)
     end
 end
+
+------------------------------------------------
+-- 并发请求管理器 (优化版：支持提前返回)
+------------------------------------------------
+ConcurrentManager = {
+    active_requests = 0,
+    max_concurrent = 6,
+    pending_requests = {},
+    results = {},      -- 按 server 归档 (全部收集)
+    results_flat = {}, -- 按 index 归档 (优先级判断)
+    finished = false,
+    total_expected = 0,
+    mode = "all"       -- 默认为 'all' (等待所有)，可切换为 'priority'
+}
+
+function ConcurrentManager:new()
+    local o = {
+        active_requests = 0,
+        max_concurrent = 6,
+        pending_requests = {},
+        results = {},
+        results_flat = {},
+        final_callback = nil,
+        finished = false,
+        validator = nil,
+        mode = "all"
+    }
+    setmetatable(o, self)
+    self.__index = self
+    return o
+end
+
+function ConcurrentManager:wait_priority(total_count, validator, callback)
+    self.mode = "priority"
+    self.total_expected = total_count
+    self.validator = validator
+    self.final_callback = callback
+    self:check_completion()
+end
+
+function ConcurrentManager:wait_all(callback)
+    self.mode = "all"
+    self.final_callback = callback
+    self:check_completion()
+end
+
+-- 检查是否满足提前结束的条件
+function ConcurrentManager:check_completion()
+    if self.finished then return end
+
+    if self.mode == "priority" then
+        -- === 优先级模式逻辑 ===
+        for i = 1, self.total_expected do
+            local res = self.results_flat[i]
+            if res == nil then return end -- 高优先级还在跑，等待
+            
+            if self.validator and self.validator(res) then
+                self.finished = true
+                if self.final_callback then
+                    self.final_callback({res}) -- 只返回选中的结果
+                    self.final_callback = nil
+                end
+                return
+            end
+        end
+        -- 如果没有提前返回，检查是否全部跑完
+        if self.active_requests == 0 and #self.pending_requests == 0 then
+            self.finished = true
+            if self.final_callback then
+                local all_results = {}
+                for i = 1, self.total_expected do
+                    if self.results_flat[i] then table.insert(all_results, self.results_flat[i]) end
+                end
+                self.final_callback(all_results)
+                self.final_callback = nil
+            end
+        end
+
+    else
+        -- === 收集模式逻辑 (wait_all) ===
+        if self.active_requests == 0 and #self.pending_requests == 0 and self.final_callback then
+            local callback = self.final_callback
+            self.final_callback = nil
+            self.finished = true
+            callback()
+        end
+    end
+end
+
+function ConcurrentManager:start_request(server, key, request_func)
+    if self.finished then return end
+    if self.active_requests >= self.max_concurrent then
+        table.insert(self.pending_requests, {server = server, key = key, func = request_func})
+        return
+    end
+    self:do_request(server, key, request_func)
+end
+
+function ConcurrentManager:do_request(server, key, request_func)
+    self.active_requests = self.active_requests + 1
+    request_func(function(result)
+        if self.finished then 
+            self.active_requests = self.active_requests - 1
+            return 
+        end
+
+        if not result.server then result.server = server end
+        result.index = key
+
+        -- 1. 存入 results (兼容 get_all_servers_matches 读取 results[server])
+        if not self.results[server] then self.results[server] = {} end
+        self.results[server][key] = result
+
+        -- 2. 存入 flat (用于优先级排序)
+        self.results_flat[key] = result
+
+        self.active_requests = self.active_requests - 1
+        
+        -- 每次请求结束都检查
+        self:check_completion()
+
+        if not self.finished and #self.pending_requests > 0 and self.active_requests < self.max_concurrent then
+            local next_request = table.remove(self.pending_requests, 1)
+            self:do_request(next_request.server, next_request.key, next_request.func)
+        end
+    end)
+end
