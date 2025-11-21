@@ -18,7 +18,7 @@ jobs:
       - name: Zip project files
         run: |
           FILENAME="${{ github.event.repository.name }}.zip"
-          zip -r "$FILENAME" . -x ".github/*" -x ".git/*"
+          zip -r "$FILENAME" . -x ".github/*" -x ".git/*" -x ".gitignore"
           echo "打包完成: $FILENAME"
 
       - name: Create Release
