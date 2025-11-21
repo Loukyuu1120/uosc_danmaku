@@ -1,4 +1,4 @@
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 
 mp.commandv('script-message', 'uosc_danmaku-version', VERSION)
 

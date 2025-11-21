@@ -10,6 +10,9 @@ local current_menu_state = {
     expanded_key = nil,  -- 格式: "server|animeTitle"
     episodes = nil,
     selected_episode = nil, -- 存储手动选择的剧集信息，用于计算当前播放集的偏移
+	search_items = nil,  -- 存储手动搜索结果的items数组
+	search_query = nil,  -- 存储手动搜索关键词
+	search_seen_ids = nil,  -- 存储手动搜索的ID集合
 }
 
 local function extract_server_identifier(server_url)
@@ -51,12 +54,62 @@ function get_animes(query)
     local servers = get_api_servers()
     local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
     local items = {}
-    local message = "加载数据中...(" .. #servers .. "个服务器)"
     local menu_type = "menu_anime"
     local menu_title = "在此处输入番剧名称"
     local footnote = "使用enter或ctrl+enter进行搜索"
     local menu_cmd = { "script-message-to", mp.get_script_name(), "search-anime-event" }
 
+    -- 检查是否是相同的搜索且已有结果（从详情页返回的情况）
+    if current_menu_state.search_query == query and 
+       current_menu_state.search_items and 
+       #current_menu_state.search_items >= 1 then
+        msg.info("使用缓存的搜索结果，跳过重新搜索")
+        -- 直接使用缓存的结果
+        items = current_menu_state.search_items
+        
+        -- 移除可能存在的"正在搜索"提示
+        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
+            table.remove(items, #items)
+        end
+        
+        local result_count = #items - 1  -- 减去返回按钮
+        local final_message = result_count > 0 
+            and ("✅ 搜索到 " .. result_count .. " 个结果")
+            or "无结果"
+        
+        if uosc_available then
+            local menu_props = {
+                type = menu_type,
+                title = menu_title,
+                search_style = "palette",
+                search_debounce = "submit",
+                on_search = menu_cmd,
+                footnote = final_message,
+                search_suggestion = query,
+                items = items,
+            }
+            local json_props = utils.format_json(menu_props)
+            mp.commandv("script-message-to", "uosc", "open-menu", json_props)
+        elseif input_loaded then
+            open_menu_select(items)
+        end
+        return
+    end
+
+    -- 定时清理手动搜索缓存 (60秒) ------------------
+    if current_menu_state.timer then current_menu_state.timer:kill() end
+    current_menu_state.timer = mp.add_timeout(60, function()
+        current_menu_state.search_items, current_menu_state.search_query, current_menu_state.search_seen_ids = nil, nil, nil
+        current_menu_state.timer = nil
+        msg.info("搜索缓存已过期自动清理")
+    end)
+
+    -- 新搜索：清空之前的缓存
+    current_menu_state.search_items = nil
+    current_menu_state.search_query = nil
+    current_menu_state.search_seen_ids = nil
+
+    -- 添加返回按钮
     table.insert(items, {
         title = "← 返回",
         value = { "script-message-to", mp.get_script_name(), "open_search_danmaku_menu" },
@@ -64,20 +117,91 @@ function get_animes(query)
         selectable = true,
     })
 
+    -- 添加正在搜索提示项
+    table.insert(items, {
+        title = "⏳ 正在搜索...(" .. #servers .. "个服务器)",
+        italic = true,
+        keep_open = true,
+        selectable = false,
+    })
+
     if uosc_available then
-        update_menu_uosc(menu_type, menu_title, message, footnote, menu_cmd, query)
+        update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
     else
-        show_message(message, 30)
+        show_message("加载数据中...(" .. #servers .. "个服务器)", 30)
     end
 
-    msg.verbose("尝试获取番剧数据：" .. endpoint .. " (服务器数量: " .. #servers .. ")")
+    msg.verbose("尝试获取番剧数据:" .. endpoint .. " (服务器数量: " .. #servers .. ")")
 
     -- 使用集合来避免重复
     local seen_anime_ids = {}
     local total_results = 0
+    local completed_servers = 0
     local concurrent_manager = ConcurrentManager:new()
     local request_count = 0  -- 记录实际发起的请求数量
 
+    -- 保存到全局状态
+    current_menu_state.search_items = items
+    current_menu_state.search_query = query
+    current_menu_state.search_seen_ids = seen_anime_ids
+
+    -- 渐进式更新菜单的函数
+    local function update_menu_incrementally(new_animes, server_name)
+        if not new_animes or #new_animes == 0 then
+            return
+        end
+
+        local added_count = 0
+        
+        for _, anime in ipairs(new_animes) do
+            local anime_id = anime.bangumiId or anime.animeId
+            if anime_id and not seen_anime_ids[anime_id] then
+                local server_identifier = extract_server_identifier(server_name)
+                local display_title = anime.animeTitle
+                if server_identifier then
+                    display_title = display_title .. " [" .. server_identifier .. "]"
+                end
+                
+                -- 插入到倒数第二个位置（加载提示之前）
+                table.insert(items, #items, {
+                    title = display_title,
+                    hint = anime.typeDescription,
+                    value = {
+                        "script-message-to",
+                        mp.get_script_name(),
+                        "search-episodes-event",
+                        anime.animeTitle,  -- 保持原始title，不带服务器标识
+                        anime.bangumiId,
+                        server_name,
+                        query
+                    },
+                })
+                seen_anime_ids[anime_id] = true
+                total_results = total_results + 1
+                added_count = added_count + 1
+            end
+        end
+
+        if added_count > 0 and uosc_available then
+            local progress_message = string.format("已加载 %d 个结果 (进度: %d/%d)", 
+                total_results, completed_servers, #servers)
+            
+            local menu_props = {
+                type = menu_type,
+                title = menu_title,
+                search_style = "palette",
+                search_debounce = "submit",
+                on_search = menu_cmd,
+                footnote = progress_message,
+                search_suggestion = query,
+                items = items,
+            }
+            local json_props = utils.format_json(menu_props)
+            mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+        end
+    end
+
+    -- 为每个服务器发起请求
     for i, server in ipairs(servers) do
         local url = server .. endpoint
         local args = make_danmaku_request_args("GET", url, nil, nil)
@@ -85,22 +209,31 @@ function get_animes(query)
             request_count = request_count + 1  -- 只有成功创建args的请求才计数
             local request_func = function(callback)
                 call_cmd_async(args, function(error, json)
+                    completed_servers = completed_servers + 1
+                    
                     local result = {
                         success = false,
                         server = server,
                         animes = {}
                     }
+                    
                     if not error and json then
                         local success, parsed = pcall(utils.parse_json, json)
                         if success and parsed and parsed.animes then
                             result.success = true
                             result.animes = parsed.animes
+                            
+                            -- 立即更新菜单,不等待其他服务器
+                            update_menu_incrementally(parsed.animes, server)
                         end
                     end
+                    
                     callback(result)
                 end)
             end
             concurrent_manager:start_request(server, i, request_func)
+        else
+            completed_servers = completed_servers + 1
         end
     end
 
@@ -117,48 +250,35 @@ function get_animes(query)
         return
     end
 
+    -- 所有请求完成后的最终处理
     local callback_executed = false
     concurrent_manager:wait_all(function()
         if callback_executed then
             return
         end
         callback_executed = true
-        for server, server_results in pairs(concurrent_manager.results) do
-            for key, result in pairs(server_results) do
-                if result.success and result.animes then
-                    for _, anime in ipairs(result.animes) do
-                        local anime_id = anime.bangumiId or anime.animeId
-                        if anime_id and not seen_anime_ids[anime_id] then
-                            local server_identifier = extract_server_identifier(server)
-                            local display_title = anime.animeTitle
-                            if server_identifier then
-                                display_title = display_title .. " [" .. server_identifier .. "]"
-                            end
-                            table.insert(items, {
-                                title = display_title,
-                                hint = anime.typeDescription,
-                                value = {
-                                    "script-message-to",
-                                    mp.get_script_name(),
-                                    "search-episodes-event",
-                                    anime.animeTitle,  -- 保持原始title，不带服务器标识
-                                    anime.bangumiId,
-                                    server,
-                                    query
-                                },
-                            })
-                            seen_anime_ids[anime_id] = true
-                            total_results = total_results + 1
-                        end
-                    end
-                end
-            end
+
+        -- 移除"正在搜索"提示
+        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
+            table.remove(items, #items)
         end
 
+        -- 最终状态更新
         if total_results > 0 then
-            local message = "✅ 搜索到 " .. total_results .. " 个结果"
+            local final_message = "✅ 搜索到 " .. total_results .. " 个结果"
             if uosc_available then
-                update_menu_uosc(menu_type, menu_title, items, footnote, menu_cmd, query)
+                local menu_props = {
+                    type = menu_type,
+                    title = menu_title,
+                    search_style = "palette",
+                    search_debounce = "submit",
+                    on_search = menu_cmd,
+                    footnote = final_message,
+                    search_suggestion = query,
+                    items = items,
+                }
+                local json_props = utils.format_json(menu_props)
+                mp.commandv("script-message-to", "uosc", "update-menu", json_props)
             elseif input_loaded then
                 show_message("", 0)
                 mp.add_timeout(0.1, function()
@@ -2046,7 +2166,7 @@ function open_danmaku_source_menu(force_refresh)
     -- 没有缓存数据或强制刷新，显示加载提示并获取数据
     if not has_cached_data or force_refresh then
         table.insert(items, {
-            title = "正在加载匹配结果...",
+            title = "正在搜索匹配结果...",
             italic = true,
             keep_open = true,
             selectable = false,
@@ -2269,7 +2389,7 @@ local function expand_episodes_in_menu(server, bangumiId, animeTitle, match_json
             true,
             current_menu_state.expanded_key, -- 保持当前的展开状态，直到加载完成
             current_server,
-            loading_key -- 传递正在加载的 key
+            loading_key -- 传递正在搜索的 key
         )
 
         local menu_props = {
