@@ -594,7 +594,7 @@ function fetch_danmaku_data(args, callback)
     call_cmd_async(args, function(error, json)
         async_running = false
         if error then
-            msg.info("获取弹幕数据请稍后在选择弹幕源里重试。错误信息: " .. error)
+            msg.info("获取弹幕数据出错，请稍后在选择弹幕源里重试。错误信息: " .. error)
             show_message("弹幕请求失败，打开控制台查看详情", 5)
             return
         end
