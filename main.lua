@@ -1,4 +1,4 @@
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 
 mp.commandv('script-message', 'uosc_danmaku-version', VERSION)
 
@@ -553,14 +553,67 @@ function save_danmaku(not_forced)
     end
 end
 
+-- 根据当前使用的 API URL，获取剩余可用的服务器列表
+function get_remaining_servers(current_api_url)
+    local servers = get_api_servers()
+    if #servers <= 1 then return nil end
+
+    local current_idx = -1
+    for i, server in ipairs(servers) do
+        if current_api_url:find(server, 1, true) then
+            current_idx = i
+            break
+        end
+    end
+
+    if current_idx ~= -1 and current_idx < #servers then
+        local remaining = {}
+        for k = current_idx + 1, #servers do
+            table.insert(remaining, servers[k])
+        end
+        return remaining, current_idx, #servers
+    end
+
+    return nil
+end
+
 -- 加载弹幕
 function load_danmaku(from_menu, no_osd)
     if not ENABLED then return end
     local temp_file = "danmaku-" .. PID .. ".ass"
     local danmaku_file = utils.join_path(DANMAKU_PATH, temp_file)
     local danmaku_input, delays = collect_danmaku_sources()
-    -- 如果没有弹幕文件，退出加载
+
+    -- 如果弹幕列表为空，尝试自动切换
     if #danmaku_input == 0 then
+        local current_api_url = nil
+        for url, source in pairs(DANMAKU.sources) do
+            if source.from == "api_server" and url:find("^http") then
+                current_api_url = url
+                break
+            end
+        end
+
+        if current_api_url then
+            -- 获取剩余服务器
+            local remaining, idx, total = get_remaining_servers(current_api_url)
+
+            if remaining then
+                msg.info(string.format("当前服务器弹幕为空，切换备用列表 (%d/%d)", idx + 1, total))
+                show_message(string.format("无弹幕，尝试切换备用API (%d/%d)", idx + 1, total), 3)
+
+                -- 清理旧源
+                DANMAKU.sources[current_api_url] = nil
+
+                -- 直接调用优化后的入口，传入剩余服务器列表
+                local path = mp.get_property("path")
+                local filename = mp.get_property("filename")
+                get_danmaku_with_hash(filename, path, remaining)
+
+                return
+            end
+        end
+
         show_message("该集弹幕内容为空，结束加载", 3)
         msg.verbose("该集弹幕内容为空，结束加载")
         COMMENTS = {}
@@ -763,12 +816,10 @@ function auto_load_danmaku(path, dir, filename, number)
         local history_json = read_file(HISTORY_PATH)
         if history_json ~= nil then
             local history = utils.parse_json(history_json) or {}
-            -- 1.判断父文件名是否存在
             local history_dir = history[dir]
             if history_dir ~= nil then
-                --2.如果存在，则获取number和id
                 DANMAKU.anime = history_dir.animeTitle
-                local episode_number = history_dir.episodeTitle and history_dir.episodeTitle:match("%d+")
+                local episode_number = history_dir.episodeTitle and get_episode_number(history_dir.episodeTitle)
                 local history_number = history_dir.episodeNumber
                 local history_id = history_dir.episodeId
                 local history_fname = history_dir.fname
@@ -790,13 +841,14 @@ function auto_load_danmaku(path, dir, filename, number)
                     playing_number = get_episode_number(filename)
                 end
                 if playing_number ~= nil then
-                    local x = playing_number - history_number --获取集数差值
+                    local x = playing_number - history_number -- 获取集数差值
                     DANMAKU.episode = episode_number and string.format("第%s话", episode_number + x) or history_dir.episodeTitle
                     show_message("自动加载上次匹配的弹幕", 3)
                     msg.verbose("自动加载上次匹配的弹幕")
                     if history_id then
                         local tmp_id = tostring(x + history_id)
                         set_episode_id(tmp_id, history_server)
+                        apply_danmaku_offset_update(x, history_server)
                     elseif history_extra then
                         local episodenum = history_extra.episodenum + x
                         get_details(history_extra.class, history_extra.id, history_extra.site,

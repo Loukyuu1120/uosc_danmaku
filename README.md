@@ -54,6 +54,28 @@ Ctrl+c script-message open_danmaku_source_menu
 
 配置详见： [#match_cache_path](#match_cache_path)
 
+## 🆕 3. 其他新增配置项
+
+### hash_for_url
+
+#### 功能说明
+
+开启此选项后，会对网络视频文件进行哈希计算尝试自动加载弹幕。该功能默认开启，因为对网络视频计算哈希可能会消耗较多时间和带宽。关闭后对网络视频文件不会进行哈希计算，从而加快启动速度。
+
+#### 使用方法
+
+想要关闭此选项，请在 mpv 配置文件夹下的 `script-opts`中创建 `uosc_danmaku.conf`文件并添加如下内容：
+
+```
+hash_for_url=no
+```
+
+注意 ⚠️：
+
+- 此功能仅在 [autoload_for_url](#autoload_for_url) 开启时生效
+- 对网络视频计算哈希会下载文件的部分数据块，可能影响播放启动速度
+- 建议仅在网络条件良好时启用
+
 # uosc_danmaku
 
 在 MPV 播放器中加载弹弹 play 弹幕，基于 uosc UI 框架和弹弹 play API 的 mpv 弹幕扩展插件

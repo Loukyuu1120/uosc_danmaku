@@ -17,6 +17,8 @@ options = {
     auto_load = false,
     autoload_local_danmaku = false,
     autoload_for_url = false,
+    -- 下载部分url视频文件用于hash计算，默认启用
+    hash_for_url = true,
     save_danmaku = false,
     user_agent = "mpv_danmaku/1.0",
     proxy = "",

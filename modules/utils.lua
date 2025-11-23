@@ -465,7 +465,7 @@ function get_episode_number(filename, fname)
     end
 
     local thin_space = string.char(0xE2, 0x80, 0x89)
-    filename = filename:gsub(thin_space, " ")
+    filename = (filename or ""):gsub(thin_space, " ")
 
     local title = format_filename(filename)
     if title then
@@ -778,7 +778,7 @@ function ConcurrentManager:check_completion()
         for i = 1, self.total_expected do
             local res = self.results_flat[i]
             if res == nil then return end -- 高优先级还在跑，等待
-            
+
             if self.validator and self.validator(res) then
                 self.finished = true
                 if self.final_callback then
@@ -824,9 +824,9 @@ end
 function ConcurrentManager:do_request(server, key, request_func)
     self.active_requests = self.active_requests + 1
     request_func(function(result)
-        if self.finished then 
+        if self.finished then
             self.active_requests = self.active_requests - 1
-            return 
+            return
         end
 
         if not result.server then result.server = server end
@@ -840,7 +840,7 @@ function ConcurrentManager:do_request(server, key, request_func)
         self.results_flat[key] = result
 
         self.active_requests = self.active_requests - 1
-        
+
         -- 每次请求结束都检查
         self:check_completion()
 

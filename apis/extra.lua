@@ -32,22 +32,17 @@ local function load_extra_danmaku(url, episode, number, class, id, site, title, 
     add_danmaku_source(play_url, true)
 end
 
-local function query_tmdb(title, class, menu)
+function query_tmdb(title, class, menu)
+    if class == "tvseries" or class == "ova" then
+        class = "tv"
+    end
+
     local encoded_title = url_encode(title)
     local url = string.format("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&language=zh-CN",
-    class, Base64.decode(options.tmdb_api_key), encoded_title)
+        class, Base64.decode(options.tmdb_api_key), encoded_title)
 
-    local cmd = {
-        "curl",
-        "-s",
-        "-H", "accept: application/json",
-        url
-    }
-
-    if options.proxy ~= "" then
-        table.insert(cmd, '-x')
-        table.insert(cmd, options.proxy)
-    end
+    local cmd = get_base_curl_args()
+    table.insert(cmd, url)
 
     local res = mp.command_native({
         name = "subprocess",
@@ -56,21 +51,61 @@ local function query_tmdb(title, class, menu)
         capture_stderr = true,
     })
 
-    local data = utils.parse_json(res.stdout)
-    if not res.status or res.status ~= 0 or not data.results or #data.results == 0 then
-        local message = "获取 tmdb 中文数据失败"
-        if uosc_available then
-            update_menu_uosc(menu.type, menu.title, message, menu.footnote, menu.cmd, title)
-        else
-            show_message(message, 3)
+    if res.status ~= 0 then
+        if menu then
+            local message = "获取 tmdb 中文数据失败"
+            if uosc_available then
+                update_menu_uosc(menu.type, menu.title, message, menu.footnote, menu.cmd, title)
+            else
+                show_message(message, 3)
+            end
+            msg.error("获取 tmdb 中文数据失败：" .. (res.stderr or res.stdout or "未知错误"))
         end
-        msg.error("获取 tmdb 中文数据失败：" .. res.stdout)
+        return nil
+    end
+
+    local success, data = pcall(utils.parse_json, res.stdout)
+    if not success or not data then
+        if menu then
+            local message = "解析 tmdb 数据失败"
+            if uosc_available then
+                update_menu_uosc(menu.type, menu.title, message, menu.footnote, menu.cmd, title)
+            else
+                show_message(message, 3)
+            end
+            msg.error("解析 tmdb 数据失败：" .. (res.stdout or "无响应"))
+        end
+        return nil
+    end
+
+    if data.status_code and data.status_code == 34 then
+        if menu then
+            local message = "TMDB资源未找到"
+            if uosc_available then
+                update_menu_uosc(menu.type, menu.title, message, menu.footnote, menu.cmd, title)
+            else
+                show_message(message, 3)
+            end
+        end
+        return nil
+    end
+
+    if not data.results or #data.results == 0 then
+        if menu then
+            local message = "未找到匹配的TMDB数据"
+            if uosc_available then
+                update_menu_uosc(menu.type, menu.title, message, menu.footnote, menu.cmd, title)
+            else
+                show_message(message, 3)
+            end
+        end
+        return nil
+    end
+
+    if class == "tv" then
+        return data.results[1].name
     else
-        if class == "tv" then
-            return data.results[1].name
-        else
-            return data.results[1].title
-        end
+        return data.results[1].title
     end
 end
 

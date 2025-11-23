@@ -13,6 +13,10 @@ local current_menu_state = {
 	search_id = nil,  -- 存储手动搜索的唯一ID
 	search_items = nil,  -- 存储手动搜索结果的items数组
 	search_query = nil,  -- 存储手动搜索关键词
+    timer = nil, -- 定时清理器
+    single_server_search_id = nil, -- 单服务器搜索唯一ID
+    single_server_cache = nil, -- 单服务器搜索缓存
+    single_server_timer = nil, -- 单服务器定时清理器
 }
 
 local function create_menu_props(menu_type, menu_title, items, footnote, menu_cmd, query)
@@ -87,7 +91,6 @@ function get_animes(query)
     end
 
     if use_cache then
-        msg.info("使用缓存的搜索结果，跳过重新搜索")
         local items = current_menu_state.search_items
 
         -- 清理可能残留的加载提示
@@ -509,7 +512,7 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query, is_s
     end
 end
 
-function update_menu_uosc(menu_type, menu_title, menu_item, menu_footnote, menu_cmd, query, selected_index)
+function update_menu_uosc(menu_type, menu_title, menu_item, menu_footnote, menu_cmd, query)
     local items = {}
     if type(menu_item) == "string" then
         table.insert(items, {
@@ -524,7 +527,7 @@ function update_menu_uosc(menu_type, menu_title, menu_item, menu_footnote, menu_
         items = menu_item
     end
 
-    local menu_props = create_menu_props(menu_type, menu_title, items, menu_footnote, menu_cmd, query, selected_index)
+    local menu_props = create_menu_props(menu_type, menu_title, items, menu_footnote, menu_cmd, query)
     local json_props = utils.format_json(menu_props)
     mp.commandv("script-message-to", "uosc", "open-menu", json_props)
 end
@@ -1311,67 +1314,46 @@ local function get_match_from_cache(server)
     return nil, nil, nil, nil
 end
 
--- 处理搜索结果，完全使用 dandanplay.lua 的逻辑
--- 暴露给 dandanplay.lua 使用
-function process_anime_matches(animes, title, season_num, result_server)
-    local filtered_animes = {}
-    local anime_type = "tvseries"
-    local lower_title = title:lower()
-    if lower_title:match("ova") or lower_title:match("oad") then
-        anime_type = "ova"
-    elseif lower_title:match("剧场版") or lower_title:match("movie") or lower_title:match("劇場版") then
-        anime_type = "movie"
-    end
-    local function filter_by_type(animes, t)
-        local result = {}
-        for _, a in ipairs(animes) do
-            if a.type == t or (t == "tvseries" and (a.type == "jpdrama")) then
-                table.insert(result, a)
+function apply_danmaku_offset_update(offset_x, current_server)
+    local cache_key = get_cache_key()
+    if MATCH_CACHE[cache_key] and MATCH_CACHE[cache_key].servers then
+        for srv, data in pairs(MATCH_CACHE[cache_key].servers) do
+            if data.matches then
+                for _, m in ipairs(data.matches) do
+                    local episodeNumber = get_episode_number(m.episodeTitle)
+                    if not episodeNumber then
+                        local _, _, ep_num = parse_title(mp.get_property("filename/no-ext"))
+                        episodeNumber = ep_num
+                    end
+                    if m.episodeId and episodeNumber then
+                        local old_id = tonumber(m.episodeId)
+                        local old_num = tonumber(episodeNumber)
+
+                        if old_id and old_num then
+                            m.episodeId = old_id + offset_x
+                            m.episodeNumber = old_num + offset_x
+                            m.episodeTitle = string.format("第%s话", m.episodeNumber)
+                            save_match_to_cache(srv, data.matches, data.match_type, data.danmaku_counts, data.locked, false)
+                            if srv == current_server then
+                                save_selected_episode_with_offset(
+                                    srv,
+                                    DANMAKU.anime,
+                                    m.episodeTitle,
+                                    m.episodeId,
+                                    m.bangumiId
+                                )
+                            end
+                        end
+                    end
+                end
             end
         end
-        return result
+        save_match_cache()
+        current_menu_state.all_results = MATCH_CACHE[cache_key].servers
+        current_menu_state.servers = get_api_servers()
+        current_menu_state.expanded_key = nil
+        current_menu_state.episodes = nil
     end
-    filtered_animes = filter_by_type(animes, anime_type)
-    if #filtered_animes == 0 and anime_type == "tvseries" and not season_num then
-        filtered_animes = filter_by_type(animes, "movie")
-    end
-    local best_match, best_score = nil, -1
-    if #filtered_animes == 1 then
-        best_match = filtered_animes[1]
-        best_score = 1
-    elseif #filtered_animes > 1 then
-        local base_title = title:gsub("%s*%(%d+%)", ""):gsub("^%s*(.-)%s*$", "%1")
-        local target_title = base_title
-        if is_english(base_title) then
-            local chinese_title = query_tmdb_chinese_title(base_title, anime_type)
-            if chinese_title then
-                base_title = chinese_title
-            end
-        end
-        if tonumber(season_num) and tonumber(season_num) > 1 then
-            target_title = base_title .. " 第" .. number_to_chinese(season_num) .. "季"
-        else
-            target_title = base_title .. " 第一季"
-        end
-        for _, anime in ipairs(filtered_animes) do
-            local anime_title = anime.animeTitle or ""
-            local score = jaro_winkler(target_title, anime_title)
-            local anime_season = extract_season(anime_title)
-            if tonumber(anime_season) and anime_season ~= tonumber(season_num) then
-                score = score - 0.2
-            end
-            if score > best_score then
-                best_score = score
-                best_match = anime
-            end
-        end
-    end
-    local threshold = 0.75
-    if best_match and best_score >= threshold and not best_match.animeTitle:find("搜索正在") then
-        best_match.similarity = best_score
-        return {best_match}
-    end
-    return {}
 end
 
 -- 处理文件匹配结果（用于非 dandanplay 服务器）
@@ -1399,8 +1381,6 @@ local function process_file_match_results(results, title, servers)
                     -- 检查animeid是否包含在episodeId中，且episodeId不是以animeid开头
                     if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
                         match.bangumiId = "A" .. animeId_str
-                        msg.verbose(string.format("转换bangumiId: animeId=%s, episodeId=%s, 新bangumiId=%s",
-                            animeId_str, episodeId_str, match.bangumiId))
                     end
                 end
                 matches = {match}
@@ -1545,7 +1525,7 @@ local function get_all_servers_matches(file_path, file_name, callback, update_cu
     if #other_servers > 0 then
         local hash = nil
         local file_info = utils.file_info(file_path)
-        if file_info and file_info.size > 16 * 1024 * 1024 then
+        if not is_protocol(file_path) and file_info and file_info.size > 16 * 1024 * 1024 then
             local file, error = io.open(normalize(file_path), 'rb')
             if file and not error then
                 local m = MD5.new()
@@ -1705,6 +1685,43 @@ end
 
 -- 单个服务器搜索功能
 function search_single_server(server, query)
+    -- 尝试读取缓存
+    if current_menu_state.single_server_cache and
+       current_menu_state.single_server_cache.server == server and
+       current_menu_state.single_server_cache.query == query and
+       current_menu_state.single_server_cache.items then
+
+        local items = current_menu_state.single_server_cache.items
+        local menu_type = "menu_single_server_result"
+        local menu_title = "搜索结果 - " .. extract_server_identifier(server)
+
+        local result_props = {
+            type = menu_type,
+            title = menu_title,
+            search_style = "disabled",
+            items = items
+        }
+        -- 稍微延时确保UI响应流畅
+        mp.add_timeout(0.05, function()
+            mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(result_props))
+        end)
+        return
+    end
+
+    -- 初始化新搜索状态
+    current_menu_state.single_server_search_id = (current_menu_state.single_server_search_id or 0) + 1
+    local this_search_id = current_menu_state.single_server_search_id
+
+    -- 清理旧的定时器并设置新的自动清理定时器（60秒后过期）
+    if current_menu_state.single_server_timer then current_menu_state.single_server_timer:kill() end
+    current_menu_state.single_server_timer = mp.add_timeout(60, function()
+        if current_menu_state.single_server_search_id == this_search_id then
+            current_menu_state.single_server_cache = nil
+            current_menu_state.single_server_timer = nil
+        end
+    end)
+
+    -- 执行搜索请求
     local encoded_query = url_encode(query)
     local endpoint = "/api/v2/search/anime?keyword=" .. encoded_query
     local url = server .. endpoint
@@ -1713,20 +1730,23 @@ function search_single_server(server, query)
     local menu_title = "搜索结果 - " .. extract_server_identifier(server)
 
     -- 显示加载状态
-    local items = {
+    local loading_items = {
         { title = "正在搜索...", italic = true, keep_open = true, selectable = false }
     }
     local menu_props = {
         type = menu_type,
         title = menu_title,
         search_style = "disabled",
-        items = items
+        items = loading_items
     }
     mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(menu_props))
 
     local args = make_danmaku_request_args("GET", url, nil, nil)
     if args then
         call_cmd_async(args, function(error, json)
+            -- 检查ID是否匹配，防止旧请求覆盖新请求
+            if current_menu_state.single_server_search_id ~= this_search_id then return end
+
             local items = {}
 
             -- 添加返回按钮
@@ -1741,7 +1761,6 @@ function search_single_server(server, query)
                 local success, parsed = pcall(utils.parse_json, json)
                 if success and parsed and parsed.animes and #parsed.animes > 0 then
                     for _, anime in ipairs(parsed.animes) do
-                        -- 修正重点：这里点击后改为调用 search-episodes-single-server-event
                         table.insert(items, {
                             title = anime.animeTitle,
                             hint = anime.typeDescription,
@@ -1774,6 +1793,12 @@ function search_single_server(server, query)
                     selectable = false,
                 })
             end
+
+            current_menu_state.single_server_cache = {
+                server = server,
+                query = query,
+                items = items
+            }
 
             local result_props = {
                 type = menu_type,
