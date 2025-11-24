@@ -1374,14 +1374,9 @@ local function process_file_match_results(results, title, servers)
                 local match = data.matches[1]
                 match.match_type = "episode"
                 match.similarity = 1.0
-                -- 添加判断逻辑：如果结果的animeid包含在episodeId里面且episodeId不是以animeid开头
-                if match.animeId and match.episodeId then
-                    local animeId_str = tostring(match.animeId)
-                    local episodeId_str = tostring(match.episodeId)
-                    -- 检查animeid是否包含在episodeId中，且episodeId不是以animeid开头
-                    if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
-                        match.bangumiId = "A" .. animeId_str
-                    end
+                local id = inferBangumiId(match, server)
+                if id then
+                    match.bangumiId = id
                 end
                 matches = {match}
             elseif data.matches and #data.matches > 1 then
@@ -1391,14 +1386,9 @@ local function process_file_match_results(results, title, servers)
                         match.match_type = "episode"
                         match.similarity = 1.0
                         -- 添加相同的判断逻辑
-                        if match.animeId and match.episodeId then
-                            local animeId_str = tostring(match.animeId)
-                            local episodeId_str = tostring(match.episodeId)
-                            if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
-                                match.bangumiId = "A" .. animeId_str
-                                msg.verbose(string.format("转换bangumiId: animeId=%s, episodeId=%s, 新bangumiId=%s",
-                                    animeId_str, episodeId_str, match.bangumiId))
-                            end
+                        local id = inferBangumiId(match, server)
+                        if id then
+                            match.bangumiId = id
                         end
                         matches = {match}
                         break
@@ -1410,14 +1400,9 @@ local function process_file_match_results(results, title, servers)
                     data.matches[1].similarity = 0.8
                     -- 添加相同的判断逻辑
                     local match = data.matches[1]
-                    if match.animeId and match.episodeId then
-                        local animeId_str = tostring(match.animeId)
-                        local episodeId_str = tostring(match.episodeId)
-                        if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
-                            match.bangumiId = "A" .. animeId_str
-                            msg.verbose(string.format("转换bangumiId: animeId=%s, episodeId=%s, 新bangumiId=%s",
-                                animeId_str, episodeId_str, match.bangumiId))
-                        end
+                    local id = inferBangumiId(match, server)
+                    if id then
+                        match.bangumiId = id
                     end
                     matches = {data.matches[1]}
                 end

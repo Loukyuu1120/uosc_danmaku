@@ -379,6 +379,35 @@ function match_anime_concurrent(callback, specific_servers)
     make_concurrent_danmaku_request(servers, request_config, response_handler)
 end
 
+-- 针对御坂服务器的特殊处理
+function inferBangumiId(match, server)
+    if not (match and match.animeId and match.episodeId) then
+        return nil
+    end
+
+    local animeId_str = tostring(match.animeId)
+    local episodeId_str = tostring(match.episodeId)
+
+    if episodeId_str:find(animeId_str, 1, true)
+        and not episodeId_str:startswith(animeId_str)
+    then
+        return "A" .. animeId_str
+    end
+
+    if animeId_str:startswith("9")
+        and #animeId_str == 6
+        and #episodeId_str == 14
+        and server:find("/api/v1")
+    then
+        local extracted = tonumber(episodeId_str:sub(3, 8))
+        if extracted then
+            return "A" .. tostring(extracted)
+        end
+    end
+
+    return nil
+end
+
 function process_match_result(selected_result, title, callback, forced_match)
     if not selected_result then
         msg.info("❌ 缺少服务器结果")
@@ -395,19 +424,16 @@ function process_match_result(selected_result, title, callback, forced_match)
         return
     end
 
-    if match.animeId and match.episodeId then
-        local animeId_str = tostring(match.animeId)
-        local episodeId_str = tostring(match.episodeId)
-        if episodeId_str:find(animeId_str, 1, true) and not episodeId_str:startswith(animeId_str) then
-            match.bangumiId = "A" .. animeId_str
-        end
+    local id = inferBangumiId(match, server)
+    if id then
+        match.bangumiId = id
     end
     DANMAKU.anime   = match.animeTitle
     DANMAKU.episode = match.episodeTitle
 
     msg.info("   最终使用服务器: " .. server)
-    msg.info("   动画: " .. (DANMAKU.anime or "nil"))
-    msg.info("   剧集: " .. (DANMAKU.episode or "nil"))
+    -- msg.info("   动画: " .. (DANMAKU.anime or "nil"))
+    -- msg.info("   剧集: " .. (DANMAKU.episode or "nil"))
 
     set_episode_id(match.episodeId, server)
     save_selected_episode_with_offset(
