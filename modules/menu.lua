@@ -136,10 +136,14 @@ function get_animes(query)
     -- 定时清理
     if current_menu_state.timer then current_menu_state.timer:kill() end
     current_menu_state.timer = mp.add_timeout(60, function()
-        if current_menu_state.search_id == this_search_id then
+        if current_menu_state.search_items == items then
             current_menu_state.search_items, current_menu_state.search_query = nil, nil
-            -- 清理时也清除 search_id，标记搜索已非活跃/完成
-            current_menu_state.search_id = nil
+            
+            -- 如果此时 search_id 还没清空（极少数卡死情况），也顺便清空
+            if current_menu_state.search_id == this_search_id then
+                current_menu_state.search_id = nil
+            end
+            
             current_menu_state.timer = nil
             msg.info("搜索缓存已过期自动清理")
         end
