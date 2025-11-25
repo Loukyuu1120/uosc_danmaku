@@ -76,12 +76,17 @@ function get_animes(query)
 
         use_cache = true
 
-        -- 检查: 如果缓存中包含"正在搜索"的占位符，说明上次没搜完，强制刷新
-        for _, item in ipairs(current_menu_state.search_items) do
-            if item.title and item.title:match("⏳ 正在搜索") then
-                use_cache = false
-                break
-            end
+        -- 检查: 强制刷新检查
+        local last_item = current_menu_state.search_items[#current_menu_state.search_items]
+        
+        -- 1. 检查列表末尾是否有 "正在搜索..." 提示
+        local has_loading_item = last_item.title and last_item.title:match("^⏳ 正在搜索")
+        
+        -- 2. 只有在列表有加载提示 AND search_id 已经被清空时，
+        --    才判断为 UI 元素卡死，需要强制清除缓存并重搜。
+        --    如果 search_id 存在，说明后台仍在活动（如重试中），不清理。
+        if has_loading_item and not current_menu_state.search_id then
+             use_cache = false
         end
 
         -- 检查: 如果只有返回按钮，也允许重搜
@@ -92,11 +97,6 @@ function get_animes(query)
 
     if use_cache then
         local items = current_menu_state.search_items
-
-        -- 清理可能残留的加载提示
-        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
-            table.remove(items, #items)
-        end
 
         local result_count = #items - 1
         local final_message = result_count > 0
@@ -138,6 +138,8 @@ function get_animes(query)
     current_menu_state.timer = mp.add_timeout(60, function()
         if current_menu_state.search_id == this_search_id then
             current_menu_state.search_items, current_menu_state.search_query = nil, nil
+            -- 清理时也清除 search_id，标记搜索已非活跃/完成
+            current_menu_state.search_id = nil
             current_menu_state.timer = nil
             msg.info("搜索缓存已过期自动清理")
         end
@@ -370,6 +372,8 @@ function get_animes(query)
 
     if request_count == 0 then
         local message = "无可用服务器"
+        -- 搜索未启动也清除 search_id，标记搜索已非活跃/完成
+        current_menu_state.search_id = nil
         if uosc_available then
             local menu_props = create_menu_props(menu_type, menu_title, items, message, menu_cmd, query)
             local json_props = utils.format_json(menu_props)
@@ -388,6 +392,9 @@ function get_animes(query)
         if current_menu_state.search_id ~= this_search_id then return end
         if callback_executed then return end
         callback_executed = true
+
+        -- 搜索完成后，清除 search_id，标记搜索已非活跃/完成
+        current_menu_state.search_id = nil
 
         if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
             table.remove(items, #items)
