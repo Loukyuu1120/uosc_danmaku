@@ -76,12 +76,17 @@ function get_animes(query)
 
         use_cache = true
 
-        -- 检查: 如果缓存中包含"正在搜索"的占位符，说明上次没搜完，强制刷新
-        for _, item in ipairs(current_menu_state.search_items) do
-            if item.title and item.title:match("⏳ 正在搜索") then
-                use_cache = false
-                break
-            end
+        -- 检查: 强制刷新检查
+        local last_item = current_menu_state.search_items[#current_menu_state.search_items]
+        
+        -- 1. 检查列表末尾是否有 "正在搜索..." 提示
+        local has_loading_item = last_item.title and last_item.title:match("^⏳ 正在搜索")
+        
+        -- 2. 只有在列表有加载提示 AND search_id 已经被清空时，
+        --    才判断为 UI 元素卡死，需要强制清除缓存并重搜。
+        --    如果 search_id 存在，说明后台仍在活动（如重试中），不清理。
+        if has_loading_item and not current_menu_state.search_id then
+             use_cache = false
         end
 
         -- 检查: 如果只有返回按钮，也允许重搜
@@ -92,11 +97,6 @@ function get_animes(query)
 
     if use_cache then
         local items = current_menu_state.search_items
-
-        -- 清理可能残留的加载提示
-        if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
-            table.remove(items, #items)
-        end
 
         local result_count = #items - 1
         local final_message = result_count > 0
@@ -136,8 +136,14 @@ function get_animes(query)
     -- 定时清理
     if current_menu_state.timer then current_menu_state.timer:kill() end
     current_menu_state.timer = mp.add_timeout(60, function()
-        if current_menu_state.search_id == this_search_id then
+        if current_menu_state.search_items == items then
             current_menu_state.search_items, current_menu_state.search_query = nil, nil
+            
+            -- 如果此时 search_id 还没清空（极少数卡死情况），也顺便清空
+            if current_menu_state.search_id == this_search_id then
+                current_menu_state.search_id = nil
+            end
+            
             current_menu_state.timer = nil
             msg.info("搜索缓存已过期自动清理")
         end
@@ -184,7 +190,24 @@ function get_animes(query)
     local completed_servers = 0
     local concurrent_manager = ConcurrentManager:new()
     local request_count = 0
+    local MAX_RETRIES = 10 -- 最大重试次数，防止无限循环 (约30秒)
 
+    -- 辅助函数：检查是否是加载状态条目
+    local function is_loading_item(anime)
+        return anime.animeTitle and 
+               (anime.animeTitle:find("搜索正在启动") or anime.animeTitle:find("搜索正在运行"))
+    end
+
+    -- 辅助函数：更新UI上的结果信息
+    local function send_uosc_update(loading_msg)
+        if not uosc_available then return end
+        local msg_str = loading_msg or string.format("已加载 %d 个结果 (进度: %d/%d)", total_results, completed_servers, #servers)
+        local menu_props = create_menu_props(menu_type, menu_title, items, msg_str, menu_cmd, query)
+        local json_props = utils.format_json(menu_props)
+        mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+    end
+
+    -- 增量更新结果（用于添加最终的有效结果）
     local function update_menu_incrementally(new_animes, server_name)
         if current_menu_state.search_id ~= this_search_id then return end
         if not new_animes or #new_animes == 0 then return end
@@ -192,14 +215,21 @@ function get_animes(query)
         local added_count = 0
         for _, anime in ipairs(new_animes) do
             local anime_id = anime.bangumiId or anime.animeId
-            if anime_id and not seen_anime_ids[anime_id] then
+            -- 过滤掉包含加载状态的临时条目，只添加真正的番剧结果
+            if anime_id and not seen_anime_ids[anime_id] and not is_loading_item(anime) then
                 local server_identifier = extract_server_identifier(server_name)
                 local display_title = anime.animeTitle
                 if server_identifier then
                     display_title = display_title .. " [" .. server_identifier .. "]"
                 end
 
-                table.insert(items, #items, {
+                -- 插入到列表倒数第二个位置（保留最后的"正在搜索..."提示，如果有的话）
+                local insert_pos = #items + 1
+                if items[#items] and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
+                    insert_pos = #items
+                end
+
+                table.insert(items, insert_pos, {
                     title = display_title,
                     hint = anime.typeDescription,
                     value = {
@@ -217,12 +247,50 @@ function get_animes(query)
                 added_count = added_count + 1
             end
         end
-        if added_count > 0 and uosc_available then
-            local progress_message = string.format("已加载 %d 个结果 (进度: %d/%d)",
-                total_results, completed_servers, #servers)
-            local menu_props = create_menu_props(menu_type, menu_title, items, progress_message, menu_cmd, query)
-            local json_props = utils.format_json(menu_props)
-            mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+        if added_count > 0 then
+            send_uosc_update()
+        end
+    end
+
+    -- 处理特定服务器的"临时加载状态"显示
+    local function update_server_status_item(server, status_text, type_desc)
+        local server_id = extract_server_identifier(server)
+        local display_title = string.format("%s [%s]", status_text, server_id)
+        
+        -- 1. 先查找并删除该服务器已存在的旧临时条目
+        for i, item in ipairs(items) do
+            if item._temp_server == server then
+                table.remove(items, i)
+                break -- 找到一个就删除，然后跳出，准备重新插入
+            end
+        end
+
+        -- 2. 总是插入到列表最底部（但在全局"正在搜索..."之前）
+        local insert_pos = #items + 1
+        if items[#items] and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
+            insert_pos = #items
+        end
+        
+        table.insert(items, insert_pos, {
+            title = display_title,
+            hint = type_desc or "搜索中...",
+            italic = true,
+            keep_open = true,
+            selectable = false,
+            _temp_server = server -- 标记这是临时状态
+        })
+        
+        send_uosc_update()
+    end
+
+    -- 清除特定服务器的临时状态条目
+    local function clear_server_status_item(server)
+        for i, item in ipairs(items) do
+            if item._temp_server == server then
+                table.remove(items, i)
+                send_uosc_update()
+                return
+            end
         end
     end
 
@@ -231,23 +299,75 @@ function get_animes(query)
         local args = make_danmaku_request_args("GET", url, nil, nil)
         if args then
             request_count = request_count + 1
+            
             local request_func = function(callback)
-                call_cmd_async(args, function(error, json)
-                    if current_menu_state.search_id ~= this_search_id then return end
-                    completed_servers = completed_servers + 1
+                -- 内部递归函数，增加 retry_count 参数
+                local function execute_request(retry_count)
+                    retry_count = retry_count or 0
+                    
+                    call_cmd_async(args, function(error, json)
+                        if current_menu_state.search_id ~= this_search_id then return end
 
-                    local result = { success = false, server = server, animes = {} }
-                    if not error and json then
-                        local success, parsed = pcall(utils.parse_json, json)
-                        if success and parsed and parsed.animes then
-                            result.success = true
-                            result.animes = parsed.animes
-                            update_menu_incrementally(parsed.animes, server)
+                        local result = { success = false, server = server, animes = {} }
+                        local is_still_loading = false
+                        local loading_text = ""
+                        local loading_type = ""
+
+                        if not error and json then
+                            local success, parsed = pcall(utils.parse_json, json)
+                            if success and parsed and parsed.animes then
+                                result.success = true
+                                result.animes = parsed.animes
+                                
+                                -- 检查是否包含"搜索正在启动" 或 "搜索正在运行"
+                                for _, anime in ipairs(parsed.animes) do
+                                    if is_loading_item(anime) then
+                                        is_still_loading = true
+                                        loading_text = anime.animeTitle
+                                        loading_type = anime.typeDescription or ""
+                                        msg.verbose(string.format("服务器 [%s] 状态: %s (重试: %d/%d)", server, loading_text, retry_count, MAX_RETRIES))
+                                        break
+                                    end
+                                end
+                            end
                         end
-                    end
-                    callback(result)
-                end)
+
+                        -- 如果还在加载中且未超过最大重试次数
+                        if is_still_loading and retry_count < MAX_RETRIES then
+                            -- 1. 更新UI状态
+                            update_server_status_item(server, loading_text, loading_type)
+                            
+                            -- 2. 3秒后递归重试，计数器+1
+                            mp.add_timeout(3, function()
+                                if current_menu_state.search_id == this_search_id then
+                                    execute_request(retry_count + 1)
+                                end
+                            end)
+                        else
+                            -- 1. 搜索完成（或失败或超时），清除临时进度
+                            clear_server_status_item(server)
+
+                            if is_still_loading and retry_count >= MAX_RETRIES then
+                                msg.warn("服务器 [" .. server .. "] 搜索超时，放弃等待")
+                                result.success = false -- 强制标记为失败以便不显示错误的临时结果
+                            end
+                            
+                            -- 2. 更新正式结果
+                            if result.success then
+                                update_menu_incrementally(result.animes, server)
+                            end
+
+                            -- 3. 标记任务完成
+                            completed_servers = completed_servers + 1
+                            callback(result)
+                        end
+                    end)
+                end
+                
+                -- 开始第一次请求
+                execute_request(0)
             end
+            
             concurrent_manager:start_request(server, i, request_func)
         else
             completed_servers = completed_servers + 1
@@ -256,6 +376,8 @@ function get_animes(query)
 
     if request_count == 0 then
         local message = "无可用服务器"
+        -- 搜索未启动也清除 search_id，标记搜索已非活跃/完成
+        current_menu_state.search_id = nil
         if uosc_available then
             local menu_props = create_menu_props(menu_type, menu_title, items, message, menu_cmd, query)
             local json_props = utils.format_json(menu_props)
@@ -274,6 +396,9 @@ function get_animes(query)
         if current_menu_state.search_id ~= this_search_id then return end
         if callback_executed then return end
         callback_executed = true
+
+        -- 搜索完成后，清除 search_id，标记搜索已非活跃/完成
+        current_menu_state.search_id = nil
 
         if #items > 1 and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
             table.remove(items, #items)
