@@ -397,7 +397,7 @@ function inferBangumiId(match, server)
     if animeId_str:startswith("9")
         and #animeId_str == 6
         and #episodeId_str == 14
-        and server:find("/api/v1")
+        and server:find("/api/v1/")
     then
         local extracted = tonumber(episodeId_str:sub(3, 8))
         if extracted then
@@ -688,7 +688,17 @@ function handle_danmaku_data(query, data, from_menu)
             -- 空循环，等待 2 秒
         end
         -- 重新发起请求
-        local url = get_api_servers()[1] .. "/api/v2/extcomment?url=" .. url_encode(query)
+        local servers = get_api_servers()
+        local base = servers[1]
+
+        for _, s in ipairs(servers) do
+            if s:find("api%.dandanplay%.") or s:find("/api/v1/") then
+                base = s
+                break
+            end
+        end
+
+        local url = base .. "/api/v2/extcomment?url=" .. url_encode(query)
         local args = make_danmaku_request_args("GET", url)
 
         if args == nil then
@@ -711,7 +721,18 @@ end
 
 -- 处理第三方弹幕数据
 function handle_related_danmaku(index, relateds, related, shift, callback)
-    local url = get_api_servers()[1] .. "/api/v2/extcomment?url=" .. url_encode(related["url"])
+    local servers = get_api_servers()
+    local base = servers[1]
+
+    -- 依序寻找匹配的服务器
+    for _, s in ipairs(servers) do
+        if s:find("api%.dandanplay%.") or s:find("/api/v1/") then
+            base = s
+            break
+        end
+    end
+
+    local url = base .. "/api/v2/extcomment?url=" .. url_encode(related["url"])
     show_message(string.format("正在从第三方库装填弹幕 [%d/%d]", index, #relateds), 30)
     msg.verbose("正在从第三方库装填弹幕：" .. url)
 
@@ -973,7 +994,16 @@ end
 --通过输入源url获取弹幕库
 function add_danmaku_source_online(query, from_menu)
     set_danmaku_button()
-    local url = get_api_servers()[1] .. "/api/v2/extcomment?url=" .. url_encode(query)
+    local servers = get_api_servers()
+    local base = servers[1]
+    for _, s in ipairs(servers) do
+        if s:find("api%.dandanplay%.") or s:find("/api/v1/") then
+            base = s
+            break
+        end
+    end
+
+    local url = base .. "/api/v2/extcomment?url=" .. url_encode(query)
     show_message("弹幕加载中...", 30)
     msg.verbose("尝试获取弹幕：" .. url)
     local args = make_danmaku_request_args("GET", url)
