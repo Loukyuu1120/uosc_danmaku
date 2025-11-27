@@ -152,11 +152,6 @@ function parse_danmaku(ass_file_path, from_menu, no_osd)
             end
             mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "on")
             show_danmaku_func()
-
-            -- 弹幕加载完成后，自动加载匹配结果到缓存
-            mp.add_timeout(0.5, function()
-                mp.commandv("script-message", "auto_load_danmaku_matches")
-            end)
         else
             show_message("")
             hide_danmaku_func()
@@ -176,8 +171,9 @@ local function filter_state(label, name)
 end
 
 function show_danmaku_func()
-    render()
     mp.set_property_bool(HAS_DANMAKU, true)
+    set_danmaku_visibility(true)
+    render()
     if not pause then
         timer:resume()
     end
@@ -196,6 +192,7 @@ end
 function hide_danmaku_func()
     timer:kill()
     mp.set_property_bool(HAS_DANMAKU, false)
+    set_danmaku_visibility(false)
     overlay:remove()
     if filter_state("danmaku") then
         mp.commandv("vf", "remove", "@danmaku")

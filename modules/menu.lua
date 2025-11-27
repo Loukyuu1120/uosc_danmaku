@@ -78,10 +78,10 @@ function get_animes(query)
 
         -- 检查: 强制刷新检查
         local last_item = current_menu_state.search_items[#current_menu_state.search_items]
-        
+
         -- 1. 检查列表末尾是否有 "正在搜索..." 提示
         local has_loading_item = last_item.title and last_item.title:match("^⏳ 正在搜索")
-        
+
         -- 2. 只有在列表有加载提示 AND search_id 已经被清空时，
         --    才判断为 UI 元素卡死，需要强制清除缓存并重搜。
         --    如果 search_id 存在，说明后台仍在活动（如重试中），不清理。
@@ -138,12 +138,12 @@ function get_animes(query)
     current_menu_state.timer = mp.add_timeout(60, function()
         if current_menu_state.search_items == items then
             current_menu_state.search_items, current_menu_state.search_query = nil, nil
-            
+
             -- 如果此时 search_id 还没清空（极少数卡死情况），也顺便清空
             if current_menu_state.search_id == this_search_id then
                 current_menu_state.search_id = nil
             end
-            
+
             current_menu_state.timer = nil
             msg.info("搜索缓存已过期自动清理")
         end
@@ -194,7 +194,7 @@ function get_animes(query)
 
     -- 辅助函数：检查是否是加载状态条目
     local function is_loading_item(anime)
-        return anime.animeTitle and 
+        return anime.animeTitle and
                (anime.animeTitle:find("搜索正在启动") or anime.animeTitle:find("搜索正在运行"))
     end
 
@@ -256,7 +256,7 @@ function get_animes(query)
     local function update_server_status_item(server, status_text, type_desc)
         local server_id = extract_server_identifier(server)
         local display_title = string.format("%s [%s]", status_text, server_id)
-        
+
         -- 1. 先查找并删除该服务器已存在的旧临时条目
         for i, item in ipairs(items) do
             if item._temp_server == server then
@@ -270,7 +270,7 @@ function get_animes(query)
         if items[#items] and items[#items].title and items[#items].title:match("^⏳ 正在搜索") then
             insert_pos = #items
         end
-        
+
         table.insert(items, insert_pos, {
             title = display_title,
             hint = type_desc or "搜索中...",
@@ -279,7 +279,7 @@ function get_animes(query)
             selectable = false,
             _temp_server = server -- 标记这是临时状态
         })
-        
+
         send_uosc_update()
     end
 
@@ -299,12 +299,12 @@ function get_animes(query)
         local args = make_danmaku_request_args("GET", url, nil, nil)
         if args then
             request_count = request_count + 1
-            
+
             local request_func = function(callback)
                 -- 内部递归函数，增加 retry_count 参数
                 local function execute_request(retry_count)
                     retry_count = retry_count or 0
-                    
+
                     call_cmd_async(args, function(error, json)
                         if current_menu_state.search_id ~= this_search_id then return end
 
@@ -318,7 +318,7 @@ function get_animes(query)
                             if success and parsed and parsed.animes then
                                 result.success = true
                                 result.animes = parsed.animes
-                                
+
                                 -- 检查是否包含"搜索正在启动" 或 "搜索正在运行"
                                 for _, anime in ipairs(parsed.animes) do
                                     if is_loading_item(anime) then
@@ -336,7 +336,7 @@ function get_animes(query)
                         if is_still_loading and retry_count < MAX_RETRIES then
                             -- 1. 更新UI状态
                             update_server_status_item(server, loading_text, loading_type)
-                            
+
                             -- 2. 3秒后递归重试，计数器+1
                             mp.add_timeout(3, function()
                                 if current_menu_state.search_id == this_search_id then
@@ -351,7 +351,7 @@ function get_animes(query)
                                 msg.warn("服务器 [" .. server .. "] 搜索超时，放弃等待")
                                 result.success = false -- 强制标记为失败以便不显示错误的临时结果
                             end
-                            
+
                             -- 2. 更新正式结果
                             if result.success then
                                 update_menu_incrementally(result.animes, server)
@@ -363,11 +363,11 @@ function get_animes(query)
                         end
                     end)
                 end
-                
+
                 -- 开始第一次请求
                 execute_request(0)
             end
-            
+
             concurrent_manager:start_request(server, i, request_func)
         else
             completed_servers = completed_servers + 1
@@ -1073,8 +1073,8 @@ mp.register_script_message("set", function(prop, value)
     end
     if value == "on" then
         ENABLED = true
-        set_danmaku_visibility(true)
         if COMMENTS == nil then
+            set_danmaku_visibility(true)
             local path = mp.get_property("path")
             init(path)
         else
@@ -1084,7 +1084,6 @@ mp.register_script_message("set", function(prop, value)
     else
         show_message("关闭弹幕", 2)
         ENABLED = false
-        set_danmaku_visibility(false)
         hide_danmaku_func()
     end
     mp.commandv("script-message-to", "uosc", "set", "show_danmaku", value)
@@ -1631,23 +1630,9 @@ local function get_all_servers_matches(file_path, file_name, callback, update_cu
         end
     end
 
-    -- 处理非 dandanplay 服务器（使用文件匹配方式）
+    -- 处理非 dandanplay 服务器（使用match方式，不计算哈希减少阻塞）
     if #other_servers > 0 then
-        local hash = nil
         local file_info = utils.file_info(file_path)
-        if not is_protocol(file_path) and file_info and file_info.size > 16 * 1024 * 1024 then
-            local file, error = io.open(normalize(file_path), 'rb')
-            if file and not error then
-                local m = MD5.new()
-                for _ = 1, 16 * 1024 do
-                    local content = file:read(1024)
-                    if not content then break end
-                    m:update(content)
-                end
-                file:close()
-                hash = m:finish()
-            end
-        end
         local title, season_num, episode_num = parse_title()
         local match_file_name = file_name
         if title and episode_num then
@@ -1663,8 +1648,8 @@ local function get_all_servers_matches(file_path, file_name, callback, update_cu
         local endpoint = "/api/v2/match"
         local body = {
             fileName   = match_file_name,
-            fileHash   = hash or "a1b2c3d4e5f67890abcd1234ef567890",
-            matchMode  = hash and "hashAndFileName" or "fileNameOnly"
+            fileHash   = "a1b2c3d4e5f67890abcd1234ef567890",
+            matchMode  = "fileNameOnly"
         }
         for i, server in ipairs(other_servers) do
             local url = server .. endpoint

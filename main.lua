@@ -622,6 +622,10 @@ function load_danmaku(from_menu, no_osd)
 
     convert_danmaku_format(danmaku_input, danmaku_file, delays)
     parse_danmaku(danmaku_file, from_menu, no_osd)
+    -- 弹幕加载完成后，自动加载匹配结果到缓存
+    mp.add_timeout(0.5, function()
+        mp.commandv("script-message", "auto_load_danmaku_matches")
+    end)
 end
 
 -- 为 bilibli 网站的视频播放加载弹幕
@@ -971,8 +975,8 @@ mp.register_script_message("show_danmaku_keyboard", function()
     if ENABLED then
         show_message("开启弹幕", 2)
         mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "on")
-        set_danmaku_visibility(true)
         if COMMENTS == nil then
+            set_danmaku_visibility(true)
             show_message("加载弹幕初始化...", 3)
             local path = mp.get_property("path")
             init(path)
@@ -983,7 +987,6 @@ mp.register_script_message("show_danmaku_keyboard", function()
     else
         show_message("关闭弹幕", 2)
         mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "off")
-        set_danmaku_visibility(false)
         hide_danmaku_func()
     end
 end)
