@@ -47,25 +47,8 @@ function get_base_curl_args()
     return args
 end
 
--- 定义验证器：判断结果是否“可用”，返回 true，管理器会立即停止等待后续低优先级的请求
-local function is_valid_result(result)
-    if not result then return false end
-    if result.error then return false end
-    if not result.data then return false end
-    local data = result.data
-    -- 情况A: 搜番剧
-    if data.animes and #data.animes > 0 then return true end
-    -- 情况B: 精确Hash匹配
-    if data.isMatched then return true end
-    -- 情况C: 文件名匹配
-    if data.matches and #data.matches > 0 then return true end
-    -- 情况D: 获取剧集详情
-    if data.bangumi and data.bangumi.episodes then return true end
-    return false
-end
-
 -- 并发请求多个API服务器
-local function make_concurrent_danmaku_request(servers, request_config, response_handler)
+local function make_concurrent_danmaku_request(servers, request_config, response_handler, custom_validator)
     local concurrent_manager = ConcurrentManager:new()
     local total_servers = #servers
 
@@ -106,8 +89,11 @@ local function make_concurrent_danmaku_request(servers, request_config, response
         end
     end
 
-    concurrent_manager:wait_priority(total_servers, is_valid_result, function(results)
-        -- results 可能是单个成功结果（快速返回），也可能是所有失败结果的列表
+    local validator = custom_validator or function(res)
+        return res and not res.error and res.data
+    end
+
+    concurrent_manager:wait_priority(total_servers, validator, function(results)
         table.sort(results, function(a, b)
             return a.index < b.index
         end)
@@ -246,77 +232,65 @@ function match_episode(animeTitle, bangumiId, episode_num, target_server, callba
             return make_danmaku_request_args("GET", url)
         end
     }
-    local response_handler = function(results)
-        local selected_result = nil
 
-        -- 遍历结果，优先寻找包含完整 bangumi.episodes 的成功结果
-        for _, result in ipairs(results) do
-            if result and not result.error and result.data and
-               result.data.bangumi and result.data.bangumi.episodes then
-                selected_result = result
-                break
+    -- 集数存在性校验器
+    local episode_validator = function(result)
+        if not result or result.error or not result.data then return false end
+        if not result.data.bangumi or not result.data.bangumi.episodes then return false end
+
+        local episodes = result.data.bangumi.episodes
+        local target_ep = tonumber(episode_num)
+
+        -- 遍历检查目标集数是否存在
+        for _, episode in ipairs(episodes) do
+            local ep_num = tonumber(episode.episodeNumber)
+            if ep_num and ep_num == target_ep then
+                return true -- 找到了这一集，数据有效
             end
         end
 
-        -- 如果没有找到完整结果，选择第一个成功结果
-        if not selected_result then
-            for _, result in ipairs(results) do
-                if result and not result.error and result.data then
-                    selected_result = result
-                    break
+        return false
+    end
+
+    local response_handler = function(results)
+        for _, result in ipairs(results) do
+            if episode_validator(result) then
+                local episodes = result.data.bangumi.episodes
+                for _, episode in ipairs(episodes) do
+                    local ep_num = tonumber(episode.episodeNumber)
+                    if ep_num and ep_num == tonumber(episode_num) then
+                        DANMAKU.anime = animeTitle
+                        DANMAKU.episode = episode.episodeTitle
+                        set_episode_id(episode.episodeId, result.server)
+                        local match = {
+                            animeTitle = animeTitle,
+                            episodeTitle = episode.episodeTitle,
+                            episodeId = episode.episodeId,
+                            bangumiId = bangumiId,
+                            match_type = "episode",
+                            similarity = 1.0
+                        }
+                        save_selected_episode_with_offset(
+                            result.server,
+                            animeTitle,
+                            episode.episodeTitle,
+                            episode.episodeId,
+                            bangumiId
+                        )
+                        save_match_to_cache(result.server, {match}, "episode", {}, true)
+                        callback(nil)
+                        return
+                    end
                 end
             end
         end
 
-        if not selected_result or not selected_result.data or not selected_result.data.bangumi then
-            local error_msg = "获取番剧信息失败: 所有服务器请求失败"
-            if selected_result and selected_result.error then
-                error_msg = "获取番剧信息失败: " .. selected_result.error
-            end
-            callback(error_msg)
-            return
-        end
-
-        local data = selected_result.data
-        local episodes = data.bangumi.episodes
-        local found = false
-
-        for _, episode in ipairs(episodes) do
-            local ep_num = tonumber(episode.episodeNumber)
-            if ep_num and ep_num == tonumber(episode_num) then
-                DANMAKU.anime = animeTitle
-                DANMAKU.episode = episode.episodeTitle
-                set_episode_id(episode.episodeId, selected_result.server)
-                local match = {
-                    animeTitle = animeTitle,
-                    episodeTitle = episode.episodeTitle,
-                    episodeId = episode.episodeId,
-                    bangumiId = bangumiId,
-                    match_type = "episode",
-                    similarity = 1.0
-                }
-                save_selected_episode_with_offset(
-                    selected_result.server,
-                    animeTitle,
-                    episode.episodeTitle,
-                    episode.episodeId,
-                    bangumiId
-                )
-                save_match_to_cache(selected_result.server, {match}, "episode", {}, true)
-                found = true
-                callback(nil)
-                break
-            end
-        end
-
-        if not found then
-            local error_msg = string.format("没有找到第 %d 集的匹配项，总剧集数: %d",
-                tonumber(episode_num), #episodes)
-            callback(error_msg)
-        end
+        local error_msg = string.format("所有服务器均未找到第 %s 集", tostring(episode_num))
+        if results[1] and results[1].error then error_msg = results[1].error end
+        callback(error_msg)
     end
 
-    make_concurrent_danmaku_request(servers, request_config, response_handler)
+    make_concurrent_danmaku_request(servers, request_config, response_handler, episode_validator)
 end
 
 function clean_anime_title(title)
@@ -351,32 +325,39 @@ function match_anime_concurrent(callback, specific_servers)
             return make_danmaku_request_args("GET", url)
         end
     }
+    local similarity_validator = function(result)
+        if not result or result.error or not result.data then return false end
+        if not result.data.animes or #result.data.animes == 0 then return false end
+        local matches = process_anime_matches(result.data.animes, title, season_num, result.server)
 
+        -- 如果找到了至少一个高相似度的结果，则视为有效
+        if matches and #matches > 0 then
+            return true
+        end
+
+        return false
+    end
     local response_handler = function(results)
-        local selected_result = nil
         for _, result in ipairs(results) do
-            if result.data and result.data.animes and #result.data.animes > 0 then
-                local valid_anime_count = 0
-                for _, anime in ipairs(result.data.animes) do
-                    if anime.animeTitle and anime.bangumiId then
-                        valid_anime_count = valid_anime_count + 1
+            if similarity_validator(result) then
+                local matches = process_anime_matches(result.data.animes, title, season_num, result.server)
+                local best_match = matches[1]
+                msg.verbose("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (server: " .. result.server .. ")")
+
+                -- 继续流程：获取剧集
+                match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result.server, function(error)
+                    if error then
+                        if callback then callback(error) end
+                    else
+                        if callback then callback(nil) end
                     end
-                end
-                if valid_anime_count > 0 then
-                    selected_result = result
-                    break
-                end
+                end)
+                return
             end
         end
-
-        if selected_result then
-            process_search_result(selected_result, title, season_num, episode_num, callback)
-        else
-            if callback then callback("anime_match 没有匹配") end
-        end
+        if callback then callback("所有服务器均未找到匹配番剧 (threshold >= 0.75)") end
     end
-
-    make_concurrent_danmaku_request(servers, request_config, response_handler)
+    make_concurrent_danmaku_request(servers, request_config, response_handler, similarity_validator)
 end
 
 -- 针对御坂服务器的特殊处理
@@ -431,9 +412,7 @@ function process_match_result(selected_result, title, callback, forced_match)
     DANMAKU.anime   = match.animeTitle
     DANMAKU.episode = match.episodeTitle
 
-    msg.info("   最终使用服务器: " .. server)
-    -- msg.info("   动画: " .. (DANMAKU.anime or "nil"))
-    -- msg.info("   剧集: " .. (DANMAKU.episode or "nil"))
+    msg.verbose("   最终使用服务器: " .. server)
 
     set_episode_id(match.episodeId, server)
     save_selected_episode_with_offset(
@@ -516,7 +495,7 @@ function process_search_result(result, title, season_num, episode_num, callback)
     local matches = process_anime_matches(animes, title, season_num, result_server)
     if matches and #matches > 0 then
         local best_match = matches[1]
-        msg.info("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_match.similarity or 0) .. ", 服务器: " .. result_server .. ")")
+        msg.verbose("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_match.similarity or 0) .. ", 服务器: " .. result_server .. ")")
         match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server, function(error)
             if error then
                 msg.warn("match_episode 失败: " .. error)
@@ -586,28 +565,34 @@ function match_file_concurrent(file_path, file_name, callback, specific_servers)
             }, body)
         end
     }
-    local response_handler = function(results)
-        for _, server in ipairs(servers) do
-            local r = nil
-            for _, rr in ipairs(results) do
-                if rr.server == server then
-                    r = rr
-                    break
+    local strict_validator = function(result)
+        if not result or result.error or not result.data then return false end
+        local data = result.data
+        if data.isMatched and data.matches and #data.matches == 1 then return true end
+        if data.matches and #data.matches > 1 then
+            -- 如果 title 解析失败了，只要有返回结果就算对
+            if not title then return true end
+            for _, match in ipairs(data.matches) do
+                if match.animeTitle == title then
+                    return true
                 end
             end
-            if r and r.data then
+        end
+        return false
+    end
+    local response_handler = function(results)
+        for _, r in ipairs(results) do
+            if strict_validator(r) then
                 local data = r.data
                 if data.isMatched and data.matches and #data.matches == 1 then
-                    local match = data.matches[1]
-                    msg.info("✅ 精确匹配成功: " .. match.animeTitle)
-                    process_match_result(r, title, callback, match)
+                    msg.verbose("✅ 精确匹配成功: " .. data.matches[1].animeTitle)
+                    process_match_result(r, title, callback, data.matches[1])
                     return
                 end
-                if data.matches and #data.matches > 1 then
+                if data.matches then
                     for _, match in ipairs(data.matches) do
-                        -- msg.info("server: " .. r.server .. ", 匹配候选: " .. match.animeTitle)
-                        if match.animeTitle == title then
-                            msg.info("✅ 从多个结果中根据标题选中: " .. match.animeTitle)
+                        if not title or match.animeTitle == title then
+                            msg.verbose("✅ 文件名匹配选中: " .. match.animeTitle)
                             process_match_result(r, title, callback, match)
                             return
                         end
@@ -615,9 +600,9 @@ function match_file_concurrent(file_path, file_name, callback, specific_servers)
                 end
             end
         end
-        if callback then callback("没有匹配的剧集") end
+        if callback then callback("没有匹配的剧集 (所有服务器尝试完毕)") end
     end
-    make_concurrent_danmaku_request(servers, request_config, response_handler)
+    make_concurrent_danmaku_request(servers, request_config, response_handler, strict_validator)
 end
 
 -- 异步获取弹幕数据

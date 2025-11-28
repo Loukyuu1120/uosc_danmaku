@@ -1774,7 +1774,7 @@ function save_selected_episode_with_offset(server, animeTitle, episodeTitle, epi
         bangumiId = bangumiId,
         timestamp = os.time()
     }
-    msg.info(string.format("✅ 记录选择: %s - %s (偏移: %+d)",
+    msg.verbose(string.format("✅ 记录选择: %s - %s (偏移: %+d)",
         animeTitle, episodeTitle, episode_offset or 0))
 end
 
