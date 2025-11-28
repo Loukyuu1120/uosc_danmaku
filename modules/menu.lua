@@ -1786,21 +1786,32 @@ function search_single_server(server, query)
        current_menu_state.single_server_cache.query == query and
        current_menu_state.single_server_cache.items then
 
-        local items = current_menu_state.single_server_cache.items
-        local menu_type = "menu_single_server_result"
-        local menu_title = "搜索结果 - " .. extract_server_identifier(server)
+        local has_loading_item = false
+        if current_menu_state.single_server_cache.items then
+             for _, item in ipairs(current_menu_state.single_server_cache.items) do
+                 if item.title and (item.title:match("^正在搜索") or item.title:match("搜索正在启动")) then
+                     has_loading_item = true
+                     break
+                 end
+             end
+        end
 
-        local result_props = {
-            type = menu_type,
-            title = menu_title,
-            search_style = "disabled",
-            items = items
-        }
-        -- 稍微延时确保UI响应流畅
-        mp.add_timeout(0.05, function()
-            mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(result_props))
-        end)
-        return
+        if not has_loading_item then
+            local items = current_menu_state.single_server_cache.items
+            local menu_type = "menu_single_server_result"
+            local menu_title = "搜索结果 - " .. extract_server_identifier(server)
+
+            local result_props = {
+                type = menu_type,
+                title = menu_title,
+                search_style = "disabled",
+                items = items
+            }
+            mp.add_timeout(0.05, function()
+                mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(result_props))
+            end)
+            return
+        end
     end
 
     -- 初始化新搜索状态
@@ -1824,25 +1835,46 @@ function search_single_server(server, query)
     local menu_type = "menu_single_server_result"
     local menu_title = "搜索结果 - " .. extract_server_identifier(server)
 
-    -- 显示加载状态
-    local loading_items = {
-        { title = "正在搜索...", italic = true, keep_open = true, selectable = false }
-    }
-    local menu_props = {
-        type = menu_type,
-        title = menu_title,
-        search_style = "disabled",
-        items = loading_items
-    }
-    mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(menu_props))
+    -- 初始加载状态
+    local function show_loading_menu(loading_text, hint_text)
+        local loading_items = {
+            {
+                title = loading_text or "正在搜索...",
+                hint = hint_text,
+                italic = true,
+                keep_open = true,
+                selectable = false
+            }
+        }
+        local menu_props = {
+            type = menu_type,
+            title = menu_title,
+            search_style = "disabled",
+            items = loading_items
+        }
+        return menu_props
+    end
+
+    -- 初次打开菜单
+    mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(show_loading_menu()))
 
     local args = make_danmaku_request_args("GET", url, nil, nil)
-    if args then
+    if not args then return end
+
+    local MAX_RETRIES = 10 -- 最大重试次数
+
+    -- 内部递归执行函数
+    local function execute_request(retry_count)
+        retry_count = retry_count or 0
+
         call_cmd_async(args, function(error, json)
             -- 检查ID是否匹配，防止旧请求覆盖新请求
             if current_menu_state.single_server_search_id ~= this_search_id then return end
 
             local items = {}
+            local is_still_loading = false
+            local loading_text = ""
+            local loading_hint = ""
 
             -- 添加返回按钮
             table.insert(items, {
@@ -1854,27 +1886,44 @@ function search_single_server(server, query)
 
             if not error and json then
                 local success, parsed = pcall(utils.parse_json, json)
-                if success and parsed and parsed.animes and #parsed.animes > 0 then
-                    for _, anime in ipairs(parsed.animes) do
+                if success and parsed and parsed.animes then
+                    if #parsed.animes > 0 then
+                        for _, anime in ipairs(parsed.animes) do
+                            -- 检查是否是加载状态条目
+                            if anime.animeTitle and (anime.animeTitle:find("搜索正在启动") or anime.animeTitle:find("搜索正在运行")) then
+                                is_still_loading = true
+                                loading_text = anime.animeTitle
+                                loading_hint = anime.typeDescription or ""
+                                break
+                            end
+
+                            table.insert(items, {
+                                title = anime.animeTitle,
+                                hint = anime.typeDescription,
+                                value = {
+                                    "script-message-to",
+                                    mp.get_script_name(),
+                                    "search-episodes-single-server-event",
+                                    anime.animeTitle,
+                                    tostring(anime.bangumiId or anime.animeId),
+                                    server,
+                                    query
+                                },
+                                keep_open = false,
+                                selectable = true,
+                            })
+                        end
+                    else
                         table.insert(items, {
-                            title = anime.animeTitle,
-                            hint = anime.typeDescription,
-                            value = {
-                                "script-message-to",
-                                mp.get_script_name(),
-                                "search-episodes-single-server-event",
-                                anime.animeTitle,
-                                tostring(anime.bangumiId or anime.animeId),
-                                server, -- 锁定使用该服务器
-                                query   -- 传递查询词以便返回
-                            },
-                            keep_open = false,
-                            selectable = true,
+                            title = "无匹配结果",
+                            italic = true,
+                            keep_open = true,
+                            selectable = false,
                         })
                     end
                 else
-                    table.insert(items, {
-                        title = "无匹配结果",
+                     table.insert(items, {
+                        title = "无匹配结果 (解析为空)",
                         italic = true,
                         keep_open = true,
                         selectable = false,
@@ -1889,20 +1938,77 @@ function search_single_server(server, query)
                 })
             end
 
-            current_menu_state.single_server_cache = {
-                server = server,
-                query = query,
-                items = items
-            }
+            -- 逻辑分支：继续重试 OR 显示结果
+            if is_still_loading and retry_count < MAX_RETRIES then
+                msg.verbose(string.format("单服务器 [%s] 状态: %s (重试: %d/%d)", server, loading_text, retry_count, MAX_RETRIES))
 
-            local result_props = {
-                type = menu_type,
-                title = menu_title,
-                items = items
-            }
-            mp.commandv("script-message-to", "uosc", "update-menu", utils.format_json(result_props))
+                -- 构造一个临时的加载中菜单项列表
+                local temp_loading_items = {
+                    {
+                        title = "← 返回上一级",
+                        value = { "script-message-to", mp.get_script_name(), "open_danmaku_source_menu" },
+                        keep_open = false,
+                        selectable = true,
+                    },
+                    {
+                        title = loading_text .. " (" .. (retry_count + 1) .. "/" .. MAX_RETRIES .. ")",
+                        hint = loading_hint,
+                        italic = true,
+                        keep_open = true,
+                        selectable = false,
+                    }
+                }
+
+                local result_props = {
+                    type = menu_type,
+                    title = menu_title,
+                    items = temp_loading_items
+                }
+                mp.commandv("script-message-to", "uosc", "update-menu", utils.format_json(result_props))
+
+                -- 3秒后重试
+                mp.add_timeout(3, function()
+                    if current_menu_state.single_server_search_id == this_search_id then
+                        execute_request(retry_count + 1)
+                    end
+                end)
+            else
+                -- 最终结果
+                if is_still_loading and retry_count >= MAX_RETRIES then
+                    msg.warn("服务器 [" .. server .. "] 单独搜索超时")
+                    items = {
+                         {
+                            title = "← 返回上一级",
+                            value = { "script-message-to", mp.get_script_name(), "open_danmaku_source_menu" },
+                            keep_open = false,
+                            selectable = true,
+                        },
+                        {
+                            title = "搜索超时 (服务器响应慢)",
+                            italic = true,
+                            keep_open = true,
+                            selectable = false,
+                        }
+                    }
+                end
+
+                -- 更新缓存
+                current_menu_state.single_server_cache = {
+                    server = server,
+                    query = query,
+                    items = items
+                }
+
+                local result_props = {
+                    type = menu_type,
+                    title = menu_title,
+                    items = items
+                }
+                mp.commandv("script-message-to", "uosc", "update-menu", utils.format_json(result_props))
+            end
         end)
     end
+    execute_request(0)
 end
 
 -- 构建菜单项的函数（支持展开的剧集列表）
