@@ -536,7 +536,12 @@ function match_file_concurrent(file_path, file_name, callback, specific_servers)
     local servers = specific_servers or get_api_servers()
     local hash = nil
     local file_info = utils.file_info(file_path)
-    if not is_protocol(file_path) and file_info and file_info.size >= 16 * 1024 * 1024 then
+    local excluded_path = utils.parse_json(options.excluded_path)
+    if PLATFORM == "windows" then
+        for i, path in pairs(excluded_path) do excluded_path[i] = path:gsub("/", "\\") end
+    end
+    local dir = get_parent_directory(file_path)
+    if not is_protocol(file_path) and not contains_any(excluded_path, dir) and file_info and file_info.size >= 16 * 1024 * 1024 then
         local file, error = io.open(normalize(file_path), 'rb')
         if file and not error then
             local m = MD5.new()
@@ -784,42 +789,22 @@ function handle_main_danmaku(url, from_menu)
     end
 
     fetch_danmaku_data(args, function(data)
-        if not data or not data["comments"] then
-            show_message("无数据", 3)
-            msg.info("无数据")
-            return
-        end
-
-        local comments = data["comments"]
-        local count = data["count"]
-
-        if count == 0 then
-            if DANMAKU.sources[url] == nil then
-                DANMAKU.sources[url] = {from = "api_server"}
-            end
-            load_danmaku(from_menu)
-            return
-        end
-
-        save_danmaku_data(comments, url, "api_server")
-        load_danmaku(from_menu)
+        handle_fetched_danmaku(data, url, from_menu)
     end)
 end
 
 -- 处理获取到的数据
 function handle_fetched_danmaku(data, url, from_menu)
     if data and data["comments"] then
-        if data["count"] == 0 then
-            if DANMAKU.sources[url] == nil then
-                DANMAKU.sources[url] = {from = "api_server"}
-            end
-            msg.verbose("弹幕内容为空，结束加载url：" .. url)
+        if data["count"] == 0 and DANMAKU.sources[url] == nil then
+            DANMAKU.sources[url] = {from = "api_server"}
+            load_danmaku(from_menu)
             return
         end
         save_danmaku_data(data["comments"], url, "api_server")
         load_danmaku(from_menu)
     else
-        show_message("弹幕数据加载不成功，请稍后选择弹幕源里重试", 3)
+        show_message("弹幕数据加载不成功，请稍后在选择弹幕源里重试", 3)
         msg.verbose("无数据或格式错误，结束加载url：" .. url)
     end
 end
@@ -1097,19 +1082,6 @@ function get_danmaku_with_hash(file_name, file_path, specific_servers)
     -- 如果首选服务器是 dandanplay，或者没有 MD5 库，则优先搜番剧
     if (servers[1] and servers[1]:find("api%.dandanplay%.")) or (type(MD5) ~= "table" or not MD5.sum) then
         strategy = "anime_first"
-    end
-
-    -- 处理被排除的路径
-    local dir = get_parent_directory(file_path)
-    local excluded_path = utils.parse_json(options.excluded_path)
-    if PLATFORM == "windows" then
-        for i, path in pairs(excluded_path) do excluded_path[i] = path:gsub("/", "\\") end
-    end
-
-    if contains_any(excluded_path, dir) then
-        -- 排除路径下，强制只做匹配尝试，不依赖 hash
-        execute_match_chain(strategy, file_path, file_name, servers)
-        return
     end
     if is_protocol(file_path) and options.hash_for_url then
         set_danmaku_button()

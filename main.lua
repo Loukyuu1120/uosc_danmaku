@@ -40,6 +40,7 @@ KEY = table_to_zero_indexed({
     0x19,0x1a,0x1b,0x1c,0x1d,
     0x1e,0x1f
 })
+local attempted_automatch_urls = {}
 
 PLATFORM = (function()
     local platform = mp.get_property_native("platform")
@@ -577,6 +578,35 @@ function get_remaining_servers(current_api_url)
     return nil
 end
 
+local function get_current_server()
+    for i, server in ipairs(get_api_servers()) do
+        for url, source in pairs(DANMAKU.sources) do
+            if source.from == "api_server" and url:find("^http") and url:find(server, 1, true) then
+                return server
+            end
+        end
+    end
+    return nil
+end
+
+local function switch_to_next_server(current_api_url)
+    if not current_api_url then return false end
+
+    local remaining, idx, total = get_remaining_servers(current_api_url)
+    if remaining then
+        msg.info(string.format("准备切换备用列表 (%d/%d)", idx + 1, total))
+        show_message(string.format("尝试切换备用API (%d/%d)", idx + 1, total), 3)
+
+        DANMAKU.sources[current_api_url] = nil
+
+        local path = mp.get_property("path")
+        local filename = mp.get_property("filename")
+        get_danmaku_with_hash(filename, path, remaining)
+        return true -- 切换成功
+    end
+    return false -- 没有更多服务器了
+end
+
 -- 加载弹幕
 function load_danmaku(from_menu, no_osd)
     if not ENABLED then return end
@@ -584,34 +614,36 @@ function load_danmaku(from_menu, no_osd)
     local danmaku_file = utils.join_path(DANMAKU_PATH, temp_file)
     local danmaku_input, delays = collect_danmaku_sources()
 
-    -- 如果弹幕列表为空，尝试自动切换
+    -- 如果弹幕列表为空，进入自动修复/切换流程
     if #danmaku_input == 0 then
-        local current_api_url = nil
-        for url, source in pairs(DANMAKU.sources) do
-            if source.from == "api_server" and url:find("^http") then
-                current_api_url = url
-                break
-            end
+        local current_api_url = get_current_server()
+        if current_api_url and not attempted_automatch_urls[current_api_url] then
+
+            attempted_automatch_urls[current_api_url] = true
+
+            msg.info("弹幕为空，尝试调用后台 /api/v2/match 进行匹配修复 (" .. current_api_url .. ")")
+            show_message("弹幕为空，正在尝试后台自动匹配...", 3)
+
+            local file_path = mp.get_property("path")
+            local file_name = mp.get_property("filename")
+            match_file_concurrent(file_path, file_name, function(err)
+                if err then
+                    msg.warn("自动匹配失败: " .. tostring(err))
+                    if not switch_to_next_server(current_api_url) then
+                        show_message("匹配失败且无备用源", 3)
+                    end
+                else
+                    msg.info("自动匹配流程执行成功 (等待数据加载)")
+                end
+            end, {current_api_url}) -- 只对当前服务器尝试修复
+
+            return -- 退出当前函数，等待异步结果
         end
 
         if current_api_url then
-            -- 获取剩余服务器
-            local remaining, idx, total = get_remaining_servers(current_api_url)
-
-            if remaining then
-                msg.info(string.format("当前服务器弹幕为空，切换备用列表 (%d/%d)", idx + 1, total))
-                show_message(string.format("无弹幕，尝试切换备用API (%d/%d)", idx + 1, total), 3)
-
-                -- 清理旧源
-                DANMAKU.sources[current_api_url] = nil
-
-                -- 直接调用优化后的入口，传入剩余服务器列表
-                local path = mp.get_property("path")
-                local filename = mp.get_property("filename")
-                get_danmaku_with_hash(filename, path, remaining)
-
-                return
-            end
+             if switch_to_next_server(current_api_url) then
+                 return -- 切换成功，退出等待新源加载
+             end
         end
 
         show_message("该集弹幕内容为空，结束加载", 3)
@@ -901,6 +933,7 @@ mp.register_event("file-loaded", function()
     local video = mp.get_property_native("current-tracks/video")
     local fps = mp.get_property_number("container-fps", 0)
     local duration = mp.get_property_number("duration", 0)
+    attempted_automatch_urls = {} -- 重置尝试过的自动匹配 URL 列表
     if not video or video["image"] or video["albumart"] or fps < 23 or duration < 60 then
         return
     end
