@@ -56,6 +56,24 @@ Ctrl+c script-message open_danmaku_source_menu
 
 ## 🆕 3. 其他新增配置项
 
+### autoload_danmaku_matches
+
+#### 功能说明
+
+该功能默认关闭，只有在用户打开选择弹幕源菜单时才会开始匹配所有弹幕服务器。开启后会在加载弹幕后或者文件加载时，自动匹配所有弹幕服务器，以便后面打开选择弹幕源菜单时无需等待。适合希望自动加载弹幕匹配的用户，减少等待时间。
+
+#### 使用方法
+
+想要开启此选项，请在 mpv 配置文件夹下的 `script-opts`中创建 `uosc_danmaku.conf`文件并添加如下内容：
+
+```
+autoload_danmaku_matches=yes
+```
+
+注意 ⚠️：
+
+- 此功能开启后可能导致弹幕加载完后，弹幕卡顿一阵，请开启测试没问题后再保持开启。
+
 ### hash_for_url
 
 #### 功能说明

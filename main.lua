@@ -655,9 +655,11 @@ function load_danmaku(from_menu, no_osd)
     convert_danmaku_format(danmaku_input, danmaku_file, delays)
     parse_danmaku(danmaku_file, from_menu, no_osd)
     -- 弹幕加载完成后，自动加载匹配结果到缓存
-    mp.add_timeout(0.5, function()
-        mp.commandv("script-message", "auto_load_danmaku_matches")
-    end)
+    if options.autoload_danmaku_matches and uosc_available then
+        mp.add_timeout(0.5, function()
+            mp.commandv("script-message", "auto_load_danmaku_matches")
+        end)
+    end
 end
 
 -- 为 bilibli 网站的视频播放加载弹幕
@@ -973,9 +975,8 @@ mp.register_event("file-loaded", function()
     end
 
     -- 在文件加载时自动加载匹配结果（用于弹幕源选择菜单）
-    if uosc_available and path then
+    if uosc_available and path and options.autoload_danmaku_matches then
         mp.add_timeout(1.0, function()
-            -- 延迟加载，避免影响正常播放
             if ENABLED then
                 mp.commandv("script-message", "auto_load_danmaku_matches")
             end

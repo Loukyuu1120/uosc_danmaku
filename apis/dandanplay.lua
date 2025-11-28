@@ -221,7 +221,7 @@ end
 -- 尝试通过解析文件名匹配剧集
 function match_episode(animeTitle, bangumiId, episode_num, target_server, callback)
     callback = callback or function(error)
-        if error then msg.error(error) end
+        if error then msg.verbose(error) end
     end
     local servers = target_server and {target_server} or get_api_servers()
     local request_config = {
@@ -498,14 +498,14 @@ function process_search_result(result, title, season_num, episode_num, callback)
         msg.verbose("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_match.similarity or 0) .. ", 服务器: " .. result_server .. ")")
         match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server, function(error)
             if error then
-                msg.warn("match_episode 失败: " .. error)
+                msg.verbose("match_episode 失败: " .. error)
                 if callback then callback("match_episode 失败: " .. error) end
             else
                 if callback then callback(nil) end
             end
         end)
     else
-        msg.warn("anime_match 没有找到相似度 >= 0.75")
+        msg.verbose("anime_match 没有找到相似度 >= 0.75")
         if callback then callback("anime_match 相似度不足") end
     end
 end
@@ -617,14 +617,14 @@ function fetch_danmaku_data(args, callback)
 
         -- 检查返回的json是否为空，如果为空，也可能导致卡住或解析失败
         if not json or json == "" then
-             msg.error("HTTP 请求成功返回，但数据内容为空。")
-             show_message("数据返回为空", 3)
+             msg.warn("弹幕 HTTP 请求成功返回，但数据内容为空。")
+             show_message("弹幕数据返回为空", 3)
              return
         end
 
         local success, data = pcall(utils.parse_json, json)
         if not success then
-            msg.error("JSON 解析失败" )
+            msg.warn("弹幕 JSON 解析失败" )
             show_message("弹幕数据解析失败", 3)
             return
         end
@@ -1037,14 +1037,14 @@ local function execute_match_chain(strategy, file_path, file_name, servers)
     local function fallback_to_anime(err_source)
         msg.warn(err_source .. " 失败，尝试 Fallback 到 anime_match")
         match_anime_concurrent(function(err)
-            if err then msg.error("所有匹配策略均失败: " .. err) end
+            if err then msg.verbose("所有匹配策略均失败: " .. err) end
         end, servers)
     end
 
     local function fallback_to_file(err_source)
         msg.warn(err_source .. " 失败，尝试 Fallback 到 file_match")
         match_file_concurrent(file_path, file_name, function(err)
-            if err then msg.error("所有匹配策略均失败: " .. err) end
+            if err then msg.verbose("所有匹配策略均失败: " .. err) end
         end, servers)
     end
 
