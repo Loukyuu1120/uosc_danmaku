@@ -533,11 +533,8 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query, is_s
                         for _, episode in ipairs(episodes) do
                             local ep_num = tonumber(episode.episodeNumber)
                             local is_current = false
-
-                            -- 1. 优先使用动态计算的集数匹配（如果有手动选择）
                             if dynamic_selected_episode and ep_num and ep_num == dynamic_selected_episode then
                                 is_current = true
-                            -- 2. 如果没有动态计算的集数，或者动态计算结果不匹配，回退到基于文件名的匹配
                             elseif ep_num and ep_num == current_episode_num then
                                 is_current = true
                             end
@@ -561,7 +558,6 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query, is_s
                         end
 
                         -- 更新缓存和菜单状态：将选择的结果保存到缓存中（从搜索菜单选择的结果）
-                        -- 找到当前集数对应的episode
                         local selected_episode = nil
                         for _, episode in ipairs(episodes) do
                             local ep_num = tonumber(episode.episodeNumber)
@@ -1704,43 +1700,70 @@ local function get_all_servers_matches(file_path, file_name, callback, update_cu
         end
         callback_executed = true
 
-        -- 处理 dandanplay 服务器的结果
-        for server, server_results in pairs(concurrent_manager.results) do
-            for key, result in pairs(server_results) do
-                if result.success and result.animes then
-                    local matches = process_anime_matches(result.animes, current_title, current_season, server)
-                    all_results[server] = {
-                        matches = matches,
-                        match_type = "anime",
-                        danmaku_counts = {},
-                        from_cache = false
-                    }
-                    save_match_to_cache(server, matches, "anime", {}, false, update_current_server)
-                end
-            end
-        end
+        mp.add_timeout(0.01, function()
+            local dandan_tasks = {}
 
-        -- 处理非 dandanplay 服务器的结果
-        local results = {}
-        for server, server_results in pairs(concurrent_manager.results) do
-            for i, result in pairs(server_results) do
-                if result.server and result.server:find("api%.dandanplay%.") == nil then
-                    table.insert(results, result)
+            -- 收集所有需要处理的 dandan 结果
+            for server, server_results in pairs(concurrent_manager.results) do
+                for key, result in pairs(server_results) do
+                    if result.success and result.animes then
+                        table.insert(dandan_tasks, {
+                            server = server,
+                            animes = result.animes
+                        })
+                    end
                 end
             end
-        end
-        table.sort(results, function(a, b)
-            return a.index < b.index
+
+            -- 定义处理完成后的回调
+            local function finalize_process()
+                local misaka_start = os.clock()
+                -- 处理非 dandanplay 服务器的结果
+                local results = {}
+                for server, server_results in pairs(concurrent_manager.results) do
+                    for i, result in pairs(server_results) do
+                        if result.server and result.server:find("api%.dandanplay%.") == nil then
+                            table.insert(results, result)
+                        end
+                    end
+                end
+                table.sort(results, function(a, b)
+                    return a.index < b.index
+                end)
+
+                local file_match_results = process_file_match_results(results, current_title, other_servers)
+                for server, result in pairs(file_match_results) do
+                    all_results[server] = result
+                    save_match_to_cache(server, result.matches, "episode", {}, false, update_current_server)
+                end
+                if callback then callback(all_results) end
+            end
+
+            local pending_count = #dandan_tasks
+
+            if pending_count == 0 then
+                finalize_process()
+            else
+                for _, task in ipairs(dandan_tasks) do
+                    process_anime_matches(task.animes, current_title, current_season, task.server, function(matches)
+                        if matches and #matches > 0 then
+                             all_results[task.server] = {
+                                matches = matches,
+                                match_type = "anime",
+                                danmaku_counts = {},
+                                from_cache = false
+                            }
+                            save_match_to_cache(task.server, matches, "anime", {}, false, update_current_server)
+                        end
+
+                        pending_count = pending_count - 1
+                        if pending_count == 0 then
+                            finalize_process()
+                        end
+                    end)
+                end
+            end
         end)
-
-        local file_match_results = process_file_match_results(results, current_title, other_servers)
-        for server, result in pairs(file_match_results) do
-            all_results[server] = result
-            -- 保存到缓存
-            save_match_to_cache(server, result.matches, "episode", {}, false, update_current_server)
-        end
-
-        if callback then callback(all_results) end
     end)
 end
 

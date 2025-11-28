@@ -328,35 +328,49 @@ function match_anime_concurrent(callback, specific_servers)
     local similarity_validator = function(result)
         if not result or result.error or not result.data then return false end
         if not result.data.animes or #result.data.animes == 0 then return false end
-        local matches = process_anime_matches(result.data.animes, title, season_num, result.server)
-
-        -- 如果找到了至少一个高相似度的结果，则视为有效
-        if matches and #matches > 0 then
-            return true
-        end
-
-        return false
+        return true
     end
-    local response_handler = function(results)
-        for _, result in ipairs(results) do
-            if similarity_validator(result) then
-                local matches = process_anime_matches(result.data.animes, title, season_num, result.server)
-                local best_match = matches[1]
-                msg.verbose("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (server: " .. result.server .. ")")
 
-                -- 继续流程：获取剧集
-                match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result.server, function(error)
-                    if error then
-                        if callback then callback(error) end
-                    else
-                        if callback then callback(nil) end
-                    end
-                end)
+    local response_handler = function(results)
+        -- 定义递归函数，实现异步流中的顺序尝试
+        local function try_next_result(index)
+            -- 递归终止条件：所有结果都试完了
+            if index > #results then
+                if callback then callback("所有服务器均未找到匹配番剧 (threshold >= 0.75)") end
                 return
             end
+
+            local result = results[index]
+
+            -- 再次使用同步校验器确保数据基本有效
+            if similarity_validator(result) then
+                process_anime_matches(result.data.animes, title, season_num, result.server, function(matches)
+                    if matches and #matches > 0 then
+                        local best_match = matches[1]
+                        msg.verbose("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (server: " .. result.server .. ")")
+
+                        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result.server, function(error)
+                            if error then
+                                msg.verbose("剧集匹配失败，尝试下一个服务器: " .. error)
+                                try_next_result(index + 1)
+                            else
+                                if callback then callback(nil) end
+                            end
+                        end)
+                    else
+                        -- 相似度不达标，尝试下一个服务器
+                        try_next_result(index + 1)
+                    end
+                end)
+            else
+                -- 数据无效，直接跳过
+                try_next_result(index + 1)
+            end
         end
-        if callback then callback("所有服务器均未找到匹配番剧 (threshold >= 0.75)") end
+        try_next_result(1)
     end
+
+    -- 这里的 validator 用于 ConcurrentManager 决定是否要等待后续请求。只要有数据返回，Manager 就会把结果传给 handler。
     make_concurrent_danmaku_request(servers, request_config, response_handler, similarity_validator)
 end
 
@@ -427,7 +441,8 @@ function process_match_result(selected_result, title, callback, forced_match)
     callback(nil)
 end
 
-function process_anime_matches(animes, title, season_num, result_server)
+-- 异步处理番剧匹配（支持 TMDB）
+function process_anime_matches(animes, title, season_num, result_server, callback)
     local filtered_animes = {}
     local anime_type = "tvseries"
     local lower_title = title:lower()
@@ -436,10 +451,11 @@ function process_anime_matches(animes, title, season_num, result_server)
     elseif lower_title:match("剧场版") or lower_title:match("movie") or lower_title:match("劇場版") then
         anime_type = "movie"
     end
-    local function filter_by_type(animes, t)
+
+    local function filter_by_type(animes_list, t)
         local result = {}
-        for _, a in ipairs(animes) do
-            if a.type == t or (t == "tvseries" and (a.type == "jpdrama")) then
+        for _, a in ipairs(animes_list) do
+            if a and (a.type == t or (t == "tvseries" and (a.type == "jpdrama"))) then
                 table.insert(result, a)
             end
         end
@@ -449,64 +465,63 @@ function process_anime_matches(animes, title, season_num, result_server)
     if #filtered_animes == 0 and anime_type == "tvseries" and not season_num then
         filtered_animes = filter_by_type(animes, "movie")
     end
-    local best_match, best_score = nil, -1
-    if #filtered_animes == 1 then
-        best_match = filtered_animes[1]
-        best_score = 1
-    elseif #filtered_animes > 1 then
-        local base_title = title:gsub("%s*%(%d+%)", ""):gsub("^%s*(.-)%s*$", "%1")
-        local target_title = base_title
-        if is_english(base_title) then
-            local chinese_title = query_tmdb(base_title, anime_type)
-            if chinese_title then
-                base_title = chinese_title
-            end
-        end
-        if tonumber(season_num) and tonumber(season_num) > 1 then
-            target_title = base_title .. " 第" .. number_to_chinese(season_num) .. "季"
-        else
-            target_title = base_title .. " 第一季"
-        end
-        for _, anime in ipairs(filtered_animes) do
-            local anime_title = anime.animeTitle or ""
-            local score = jaro_winkler(target_title, anime_title)
-            local anime_season = extract_season(anime_title)
-            if tonumber(anime_season) and anime_season ~= tonumber(season_num) then
-                score = score - 0.2
-            end
-            if score > best_score then
-                best_score = score
-                best_match = anime
-            end
-        end
-    end
-    local threshold = 0.75
-    if best_match and best_score >= threshold and not best_match.animeTitle:find("搜索正在") then
-        best_match.similarity = best_score
-        return {best_match}
-    end
-    return {}
-end
 
-function process_search_result(result, title, season_num, episode_num, callback)
-    local animes = result.data.animes
-    local result_server = result.server
+    local function calculate_best_match(target_title)
+        local best_match, best_score = nil, -1
 
-    local matches = process_anime_matches(animes, title, season_num, result_server)
-    if matches and #matches > 0 then
-        local best_match = matches[1]
-        msg.verbose("✅ 模糊匹配选中: " .. best_match.animeTitle .. " (score=" .. string.format("%.2f", best_match.similarity or 0) .. ", 服务器: " .. result_server .. ")")
-        match_episode(best_match.animeTitle, best_match.bangumiId, episode_num, result_server, function(error)
-            if error then
-                msg.verbose("match_episode 失败: " .. error)
-                if callback then callback("match_episode 失败: " .. error) end
+        if #filtered_animes == 1 then
+            best_match = filtered_animes[1]
+            best_score = 1
+        elseif #filtered_animes > 1 then
+            if tonumber(season_num) and tonumber(season_num) > 1 then
+                target_title = target_title .. " 第" .. number_to_chinese(season_num) .. "季"
             else
-                if callback then callback(nil) end
+                target_title = target_title .. " 第一季"
             end
-        end)
+
+            for _, anime in ipairs(filtered_animes) do
+                local anime_title = anime.animeTitle or ""
+                local score = jaro_winkler(target_title, anime_title)
+                local anime_season = extract_season(anime_title)
+                if tonumber(anime_season) and anime_season ~= tonumber(season_num) then
+                    score = score - 0.2
+                end
+                if score > best_score then
+                    best_score = score
+                    best_match = anime
+                end
+            end
+        end
+
+        local threshold = 0.75
+        local result_list = {}
+        if best_match and best_score >= threshold and not best_match.animeTitle:find("搜索正在") then
+            best_match.similarity = best_score
+            table.insert(result_list, best_match)
+        end
+
+        -- 执行回调返回结果
+        if callback then callback(result_list) end
+    end
+
+    -- 开始处理逻辑
+    if #filtered_animes > 1 then
+        local base_title = title:gsub("%s*%(%d+%)", ""):gsub("^%s*(.-)%s*$", "%1")
+
+        if is_english(base_title) then
+            query_tmdb(base_title, anime_type, nil, function(chinese_title)
+                if chinese_title then
+                    calculate_best_match(chinese_title)
+                else
+                    calculate_best_match(base_title) -- 查询失败，用原名
+                end
+            end)
+            return -- 等待回调，不再往下执行
+        else
+            calculate_best_match(base_title)
+        end
     else
-        msg.verbose("anime_match 没有找到相似度 >= 0.75")
-        if callback then callback("anime_match 相似度不足") end
+        calculate_best_match(title)
     end
 end
 
