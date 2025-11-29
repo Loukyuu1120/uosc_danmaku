@@ -45,7 +45,7 @@ function query_tmdb(title, class, menu, callback)
     end
 
     local encoded_title = url_encode(title)
-    local url = string.format("https://api.themoviedb.org/3/search/%s?api_key=%s&query=%s&language=zh-CN",
+    local url = string.format("https://api.tmdb.org/3/search/%s?api_key=%s&query=%s&language=zh-CN",
         class, Base64.decode(options.tmdb_api_key), encoded_title)
 
     local cmd = get_base_curl_args()
