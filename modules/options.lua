@@ -17,8 +17,8 @@ options = {
     auto_load = false,
     autoload_local_danmaku = false,
     autoload_for_url = false,
-    -- 弹幕加载完成后开始自动匹配所有API，默认禁用，已知可能导致弹幕显示卡顿
-    autoload_danmaku_matches = false,
+    -- 弹幕加载完成后开始自动匹配所有API，默认启用
+    autoload_danmaku_matches = true,
     -- 下载部分url视频文件用于hash计算，默认启用
     hash_for_url = true,
     save_danmaku = false,

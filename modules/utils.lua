@@ -590,13 +590,25 @@ function parse_title()
 end
 
 function extract_season(title)
+    if not title or title == "" then return 1 end
     title = title:match("^%s*(.-)%s*$") or title
-    local s = title:match("第%s*([一二三四五六七八九十]+)%s*季")
-           or title:match("第%s*([一二三四五六七八九十]+)%s*期")
-           or title:match("第%s*(%d+)%s*季")
-           or title:match("第%s*(%d+)%s*期")
-           or title:match("Season%s*(%d+)")
-           or title:match("S%s*(%d+)")
+    local cleaned_title = title:gsub("%(%s*%d+%s*%)", "")
+                      :gsub("（%s*%d+%s*）", "")
+                      :gsub("%[%s*%d+%s*%]", "")
+                      :gsub("【%s*%d+%s*】", "")
+                      :gsub("<%s*%d+%s*>", "")
+                      :gsub("{%s*%d+%s*}", "")
+    cleaned_title = cleaned_title:gsub("%f[%D]%d%d%d%d%f[%D]", " ")
+
+    local s = cleaned_title:match("第%s*([一二三四五六七八九十]+)%s*季")
+           or cleaned_title:match("第%s*([一二三四五六七八九十]+)%s*期")
+           or cleaned_title:match("第%s*(%d+)%s*季")
+           or cleaned_title:match("第%s*(%d+)%s*期")
+           or cleaned_title:match("Season%s*(%d+)")
+           or cleaned_title:match("S%s*(%d+)")
+           or cleaned_title:match("%s*(%d+)%s*%(%d+%)")
+           or cleaned_title:match("%s*(%d+)%s*（%d+）")
+           or cleaned_title:match("^%S+%s*(%d)%s*")
 
     if s then
         if tonumber(s) then
@@ -609,6 +621,20 @@ function extract_season(title)
     return 1
 end
 
+function extract_part(title)
+    title = title:lower()
+    local p = title:match("part%.?%s*(%d+)")
+    if p then return tonumber(p) end
+    local cn = title:match("第%s*([%d一二三四五六七八九十]+)%s*部分")
+    if cn then
+        if tonumber(cn) then
+            return tonumber(cn)
+        else
+            return chinese_to_number(cn)
+        end
+    end
+    return 1
+end
 
 local CHINESE_NUM_MAP = {
     ["零"] = 0, ["一"] = 1, ["二"] = 2, ["三"] = 3, ["四"] = 4,
