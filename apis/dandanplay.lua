@@ -159,19 +159,13 @@ function get_danmaku_fallback(query)
     msg.verbose("尝试获取弹幕(fallback)：" .. url)
     local args = get_base_curl_args()
     table.insert(args, url)
-    mp.command_native_async({
-        name = "subprocess",
-        args = args,
-        capture_stdout = true,
-        capture_stderr = true
-    }, function(success, res, err)
+    call_cmd_async(args, function(err, content)
         async_running = false
-        if not success or res.status ~= 0 then
+        if err then
             show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            msg.error("Fallback curl error: " .. (err or res.stderr or "unknown"))
+            msg.error("Fallback curl error: " .. err)
             return
         end
-        local content = res.stdout
         if not content or content == "" then
             msg.warn("Fallback server returned empty response")
             return
@@ -653,12 +647,12 @@ end
 function save_danmaku_data(comments, query, danmaku_source)
     -- 转换为 Lua Table
     local danmaku_list = save_danmaku_json(comments)
-    
+
     if danmaku_list then
         if DANMAKU.sources[query] == nil then
             DANMAKU.sources[query] = {from = danmaku_source}
         end
-        
+
         DANMAKU.sources[query]["data"] = danmaku_list
     end
 end
@@ -985,7 +979,7 @@ function save_danmaku_json(comments)
                             :gsub("[%z\1-\31]", "")
                             :gsub("\\", "")
                             :gsub("\"", "")
-            
+
             table.insert(danmaku_list, {
                 time = time,
                 type = type,
@@ -996,7 +990,7 @@ function save_danmaku_json(comments)
         end
     end
     table.sort(danmaku_list, function(a, b) return a.time < b.time end)
-    
+
     return danmaku_list
 end
 

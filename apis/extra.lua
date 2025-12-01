@@ -34,7 +34,6 @@ end
 
 -- 异步查询 TMDB
 function query_tmdb(title, class, menu, callback)
-    -- 如果没有 API Key，直接回调 nil
     if not options.tmdb_api_key or options.tmdb_api_key == "" then
         if callback then callback(nil) end
         return
@@ -53,16 +52,9 @@ function query_tmdb(title, class, menu, callback)
 
     msg.verbose("[TMDB] 发起异步查询: " .. title)
 
-    mp.command_native_async({
-        name = "subprocess",
-        args = cmd,
-        capture_stdout = true,
-        capture_stderr = true,
-    }, function(success, res, err)
-        if not success or res.status ~= 0 then
-            local err_msg = err or (res and res.stderr) or "未知错误"
-            msg.warn("[TMDB] 查询失败: " .. err_msg)
-
+    call_cmd_async(cmd, function(err, json)
+        if err then
+            msg.warn("[TMDB] 查询失败: " .. err)
             if menu then
                 local message = "获取 tmdb 中文数据失败"
                 if uosc_available then
@@ -71,15 +63,13 @@ function query_tmdb(title, class, menu, callback)
                     show_message(message, 3)
                 end
             end
-
             if callback then callback(nil) end
             return
         end
 
-        local json_success, data = pcall(utils.parse_json, res.stdout)
-        if not json_success or not data then
-            msg.warn("[TMDB] JSON 解析失败")
-
+        local data = utils.parse_json(json)
+        if not data then
+            msg.verbose("[TMDB] JSON 解析失败")
             if menu then
                 local message = "解析 tmdb 数据失败"
                 if uosc_available then
@@ -88,7 +78,6 @@ function query_tmdb(title, class, menu, callback)
                     show_message(message, 3)
                 end
             end
-
             if callback then callback(nil) end
             return
         end
@@ -119,15 +108,8 @@ function query_tmdb(title, class, menu, callback)
             return
         end
 
-        local cn_title = nil
-        if class == "tv" then
-            cn_title = data.results[1].name
-        else
-            cn_title = data.results[1].title
-        end
-
-        msg.info("[TMDB] 成功获取中文名: " .. (cn_title or "nil"))
-
+        local cn_title = class == "tv" and data.results[1].name or data.results[1].title
+        msg.verbose("[TMDB] 成功获取中文名: " .. (cn_title or "nil"))
         if callback then callback(cn_title) end
     end)
 end

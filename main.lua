@@ -305,9 +305,9 @@ function write_history(episodeid, server)
     local history_json = read_file(HISTORY_PATH)
     local history = {}
     if history_json then history = utils.parse_json(history_json) or {} end
-    
+
     if not history[key] then history[key] = {} end
-    
+
     local fname = mp.get_property('filename/no-ext')
     local episodeNumber = 0
     if episodeid then
@@ -333,7 +333,7 @@ function write_history(episodeid, server)
     elseif DANMAKU.extra then
         history[key].extra = DANMAKU.extra
     end
-    
+
     write_json_file(HISTORY_PATH, history)
 end
 
@@ -483,7 +483,7 @@ end
 
 -- 收集现有的弹幕源
 local function collect_danmaku_sources()
-    local danmaku_collection = {} 
+    local danmaku_collection = {}
     local delays = {}
     local key = get_cache_key()
     local history_json = read_file(HISTORY_PATH)
@@ -497,7 +497,7 @@ local function collect_danmaku_sources()
         if not source.blocked and source.data then
             local delay_segments = source.delay_segments
             if (not delay_segments or #delay_segments == 0) and history_record then
-                if history_record.sources and history_record.sources[url] and 
+                if history_record.sources and history_record.sources[url] and
                    history_record.sources[url].delay_segments then
                     delay_segments = history_record.sources[url].delay_segments
                 else
@@ -510,9 +510,9 @@ local function collect_danmaku_sources()
                     source.delay_segments = delay_segments
                 end
             end
-            
+
             delay_segments = delay_segments or {}
-            
+
             table.insert(danmaku_collection, {
                 type = "memory",
                 data = source.data,
@@ -538,7 +538,7 @@ function save_danmaku(not_forced)
     local dir = get_parent_directory(path) or ""
     local filename = mp.get_property('filename/no-ext')
     local danmaku_out = utils.join_path(dir, filename .. ".xml")
-    
+
     if not path or is_protocol(path) or (not file_exists(danmaku_out)
     and not is_writable(danmaku_out)) then
         show_message("此弹幕文件不支持保存至本地")
@@ -602,16 +602,16 @@ local function switch_to_next_server(current_api_url)
         local path = mp.get_property("path")
         local filename = mp.get_property("filename")
         get_danmaku_with_hash(filename, path, remaining)
-        return true 
+        return true
     end
-    return false 
+    return false
 end
 
 -- 加载弹幕
 function load_danmaku(from_menu, no_osd)
     if not ENABLED then return end
     local danmaku_collection, delays = collect_danmaku_sources()
-    
+
     -- 如果弹幕列表为空，进入自动修复/切换流程
     if #danmaku_collection == 0 then
         local current_api_url = get_current_server()
@@ -635,7 +635,7 @@ function load_danmaku(from_menu, no_osd)
                 end
             end, {current_api_url})
 
-            return 
+            return
         end
 
         if current_api_url then
@@ -652,7 +652,7 @@ function load_danmaku(from_menu, no_osd)
     if all_danmaku then
        render_danmaku(all_danmaku, from_menu, no_osd)
     end
-    
+
     if options.autoload_danmaku_matches and uosc_available then
         mp.add_timeout(0.5, function()
             mp.commandv("script-message", "auto_load_danmaku_matches")
@@ -698,27 +698,22 @@ function load_danmaku_for_bilibili(path)
     end
     if cid ~= nil then
         local url = "https://comment.bilibili.com/" .. cid .. ".xml"
-        local arg = {
+        local args = {
             "curl",
             "-L", "-s",
             "--compressed",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
             url,
         }
-        mp.command_native_async({
-            name = "subprocess",
-            args = arg,
-            capture_stdout = true,
-            capture_stderr = true
-        }, function(success, res, err)
+
+        call_cmd_async(args, function(err, content)
             async_running = false
-            if not success or res.status ~= 0 then
+            if err then
                 show_message("HTTP 请求失败，打开控制台查看详情", 5)
-                msg.error(err or res.stderr or "unknown error")
+                msg.error(err)
                 return
             end
-            
-            local content = res.stdout
+
             if content and content ~= "" then
                 save_danmaku_memory(path, content, "user_custom", "xml")
                 load_danmaku(true)
@@ -734,7 +729,7 @@ function load_danmaku_for_bahamut(path)
         return
     end
     local url = "https://ani.gamer.com.tw/ajax/danmuGet.php"
-    local arg = {
+    local args = {
         "curl",
         "-X", "POST",
         "-d", "sn=" .. sn,
@@ -748,29 +743,25 @@ function load_danmaku_for_bahamut(path)
         url,
     }
     if options.proxy ~= "" then
-        table.insert(arg, '-x')
-        table.insert(arg, options.proxy)
+        table.insert(args, '-x')
+        table.insert(args, options.proxy)
     end
-    mp.command_native_async({
-        name = "subprocess",
-        args = arg,
-        capture_stdout = true,
-        capture_stderr = true
-    }, function(success, res, err)
+
+    call_cmd_async(args, function(err, json)
         async_running = false
-        if not success or res.status ~= 0 then
+        if err then
             show_message("HTTP 请求失败，打开控制台查看详情", 5)
-            msg.error("Bahamut curl error: " .. (err or res.stderr or "unknown"))
+            msg.error("Bahamut curl error: " .. err)
             return
         end
-        if not res.stdout or res.stdout == "" then
+        if not json or json == "" then
             local video_url = "https://ani.gamer.com.tw/animeVideo.php?sn=" .. sn
             ENABLED = true
             add_danmaku_source_online(video_url, true)
             return
         end
 
-        local comments = utils.parse_json(res.stdout)
+        local comments = utils.parse_json(json)
         if not comments then
             return
         end
@@ -780,7 +771,7 @@ function load_danmaku_for_bahamut(path)
             local color = hex_to_int_color(comment["color"])
             local mode = get_type_from_position(comment["position"])
             local time = tonumber(comment["time"]) / 10
-            
+
             table.insert(danmaku_list, {
                 time = time,
                 color = color,
@@ -859,7 +850,7 @@ function auto_load_danmaku(path, dir, filename, number)
                     playing_number = get_episode_number(filename)
                 end
                 if playing_number ~= nil then
-                    local x = playing_number - history_number -- 获取集数差值 
+                    local x = playing_number - history_number -- 获取集数差值
                     DANMAKU.episode = episode_number and string.format("第%s话", episode_number + x) or history_dir.episodeTitle
                     show_message("自动加载上次匹配的弹幕", 3)
                     msg.verbose("自动加载上次匹配的弹幕")
