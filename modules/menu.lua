@@ -1232,13 +1232,13 @@ mp.register_script_message("load-danmaku", function(animeTitle, episodeTitle, ep
     if not used_server or used_server == "" then
         -- 从history中读取服务器信息
         local path = mp.get_property("path")
-        local dir = get_parent_directory(path)
-        if dir then
+        local key = get_cache_key()
+        if key then
             local history_json = read_file(HISTORY_PATH)
             if history_json then
                 local history = utils.parse_json(history_json) or {}
-                if history[dir] and history[dir].server then
-                    used_server = history[dir].server
+                if history[key] and history[key].server then
+                    used_server = history[key].server
                 end
             end
         end

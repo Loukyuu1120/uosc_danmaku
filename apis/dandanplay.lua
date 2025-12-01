@@ -876,11 +876,12 @@ function fetch_danmaku_all(episodeId, from_menu, specific_server)
     end)
 end
 
-function addon_danmaku(dir, from_menu)
-    if dir then
+function addon_danmaku(check_history, from_menu)
+    if check_history then
+        local key = get_cache_key()
         local history_json = read_file(HISTORY_PATH)
         local history = utils.parse_json(history_json) or {}
-        if history[dir] and history[dir].extra ~= nil then
+        if history[key] and history[key].extra ~= nil then
             return
         end
     end

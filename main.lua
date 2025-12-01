@@ -276,15 +276,15 @@ local function set_danmaku_delay(dly, time)
 end
 
 local function clear_source()
-    local path = mp.get_property("path")
+    local key = get_cache_key()
     local history_json = read_file(HISTORY_PATH)
 
-    if not path or not history_json then return end
+    if not key or not history_json then return end
 
     local history = utils.parse_json(history_json) or {}
-    if history[path] == nil then return end
+    if history[key] == nil then return end
 
-    history[path] = nil
+    history[key] = nil
     write_json_file(HISTORY_PATH, history)
 
     for url, source in pairs(DANMAKU.sources) do
@@ -339,19 +339,14 @@ end
 
 function remove_source_from_history(rm_source)
     local history_json = read_file(HISTORY_PATH)
-    local path = mp.get_property("path")
-
-    if is_protocol(path) then
-        path = remove_query(path)
-    end
-
+    local key = get_cache_key()
     if history_json then
         local history = utils.parse_json(history_json) or {}
 
-        if history[path] ~= nil and history[path]["sources"] ~= nil then
-            for source in pairs(history[path]["sources"]) do
+        if history[key] ~= nil and history[key]["sources"] ~= nil then
+            for source in pairs(history[key]["sources"]) do
                 if source == rm_source then
-                    history[path]["sources"][source] = nil
+                    history[key]["sources"][source] = nil
                     break
                 end
             end
@@ -805,14 +800,9 @@ function load_danmaku_for_url(path)
     local filename = url_decode(mp.get_property("media-title"))
     local episod_number = nil
     if title and episod_num then
-        if season_num then
-            dir = title .." Season".. season_num
-            episod_number = episod_num
-        else
-            dir = title
-        end
-        auto_load_danmaku(path, dir, filename, episod_number)
-        addon_danmaku(dir, false)
+        episod_number = episod_num
+        auto_load_danmaku(path, filename, episod_number)
+        addon_danmaku(true, false)
         return
     end
     get_danmaku_with_hash(filename, path)
@@ -820,12 +810,13 @@ function load_danmaku_for_url(path)
 end
 
 -- 自动加载上次匹配的弹幕
-function auto_load_danmaku(path, dir, filename, number)
-    if dir ~= nil then
+function auto_load_danmaku(path, filename, number)
+    local key = get_cache_key()
+    if key ~= nil then
         local history_json = read_file(HISTORY_PATH)
         if history_json ~= nil then
             local history = utils.parse_json(history_json) or {}
-            local history_dir = history[dir]
+            local history_dir = history[key]
             if history_dir ~= nil then
                 DANMAKU.anime = history_dir.animeTitle
                 local episode_number = history_dir.episodeTitle and get_episode_number(history_dir.episodeTitle)
@@ -893,8 +884,8 @@ function init(path)
         if file_exists(danmaku_xml) then
             add_danmaku_source_local(danmaku_xml, true)
         else
-            auto_load_danmaku(path, dir, filename)
-            addon_danmaku(dir, true)
+            auto_load_danmaku(path, filename)
+            addon_danmaku(true, true)
         end
     end
 end
@@ -936,8 +927,8 @@ mp.register_event("file-loaded", function()
 
     if options.auto_load then
         ENABLED = true
-        auto_load_danmaku(path, dir, filename)
-        addon_danmaku(dir, false)
+        auto_load_danmaku(path, filename)
+        addon_danmaku(true, false)
         return
     end
 
