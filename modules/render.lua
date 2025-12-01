@@ -227,9 +227,9 @@ function render_danmaku(input, from_menu, no_osd)
                 -- 颜色处理 (BGR Hex)
                 local color = d.color or 0xFFFFFF
                 local color_hex = string.format("%06X", color)
-                local b = string.sub(color_hex, 1, 2)
+                local r = string.sub(color_hex, 1, 2)
                 local g = string.sub(color_hex, 3, 4)
-                local r = string.sub(color_hex, 5, 6)
+                local b = string.sub(color_hex, 5, 6)
                 local color_tag = string.format("\\c&H%s%s%s&", b, g, r)
                 
                 local effect_tag = nil
