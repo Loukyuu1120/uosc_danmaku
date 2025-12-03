@@ -316,10 +316,12 @@ function write_history(episodeid, server)
         episodeNumber = DANMAKU.extra.episodenum
     end
 
-    local title, season_num, ep_num = parse_title()
-    if title and ep_num then
-        fname = url_decode(mp.get_property("media-title"))
-        episodeNumber = ep_num
+    if is_protocol(path) then
+        local title, season_num, episod_num = parse_title()
+        if title and episod_num then
+            fname = url_decode(mp.get_property("media-title"))
+            episodeNumber = episod_num
+        end
     end
 
     history[key].fname = fname
