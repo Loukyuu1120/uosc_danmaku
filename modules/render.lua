@@ -270,7 +270,7 @@ function render_danmaku(input, from_menu, no_osd)
         -- 触发 UI 更新
         if ENABLED and (from_menu or get_danmaku_visibility()) then
             if not no_osd then show_loaded(true) end
-            mp.commandv("script-message-to", "uosc", "set", "show_danmaku", "on")
+            set_danmaku_button()
             show_danmaku_func()
         end
     end

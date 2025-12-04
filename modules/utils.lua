@@ -376,18 +376,15 @@ function title_replace(title)
 
     if title and title ~= "" then
         -- 去重复标题段（前半段 + 后半段重复处理）
-        do
-            local left, right = title:match("^(.*)%s-%-%s-(.*)$")
-            if left and right then
-                left = left:gsub("^%s*(.-)%s*$", "%1")
-                right = right:gsub("^%s*(.-)%s*$", "%1")
+        local left, right = title:match("^(.*)%s-%-%s-(.*)$")
+        if left and right then
+            left = left:gsub("^%s*(.-)%s*$", "%1")
+            right = right:gsub("^%s*(.-)%s*$", "%1")
 
-                -- 如果右段在左段中出现 → 删除右段
-                if left:find(right, 1, true) then
-                    title = left
-                else
-                    title = left .. " - " .. right
-                end
+            if left:find(right, 1, true) then
+                title = left           -- 如果右段包含在左段中 → 删除右段
+            else
+                title = left .. " - " .. right
             end
         end
 
@@ -400,9 +397,7 @@ end
 
 function write_json_file(file_path, data)
     local file = io.open(file_path, "w")
-    if not file then
-        return
-    end
+    if not (file and data) then return end
     file:write(utils.format_json(data)) -- 将 Lua 表转换为 JSON 并写入
     file:close()
 end
@@ -858,11 +853,11 @@ function ConcurrentManager:do_request(server, key, request_func)
         if not result.server then result.server = server end
         result.index = key
 
-        -- 1. 存入 results (兼容 get_all_servers_matches 读取 results[server])
+        -- 存入 results (兼容 get_all_servers_matches 读取 results[server])
         if not self.results[server] then self.results[server] = {} end
         self.results[server][key] = result
 
-        -- 2. 存入 flat (用于优先级排序)
+        -- 存入 flat (用于优先级排序)
         self.results_flat[key] = result
 
         self.active_requests = self.active_requests - 1

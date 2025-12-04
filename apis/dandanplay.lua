@@ -136,6 +136,25 @@ function set_episode_id(input, target_server, from_menu)
             end
         end
     end
+    -- 清理历史记录中的 api_server 源
+    local key = get_cache_key()
+    if key then
+        local history_json = read_file(HISTORY_PATH)
+        if history_json then
+            local history = utils.parse_json(history_json) or {}
+            if history[key] and history[key].sources then
+                local cleaned_count = 0
+                local new_sources = {}
+                for url, source_data in pairs(history[key].sources) do
+                    if source_data.from ~= "api_server" then
+                        new_sources[url] = source_data
+                    end
+                end
+                history[key].sources = new_sources
+            end
+            write_json_file(HISTORY_PATH, history)
+        end
+    end
     local episodeId = tonumber(input)
     write_history(episodeId, target_server)
     set_danmaku_button()
@@ -648,7 +667,7 @@ function save_danmaku_data(comments, query, danmaku_source)
     -- 转换为 Lua Table
     local danmaku_list = save_danmaku_json(comments)
 
-    if danmaku_list then
+    if danmaku_list and #danmaku_list > 0 then
         if DANMAKU.sources[query] == nil then
             DANMAKU.sources[query] = {from = danmaku_source}
         end
@@ -770,10 +789,12 @@ function handle_fetched_danmaku(data, url, from_menu)
     if data and data["comments"] then
         if data["count"] == 0 and DANMAKU.sources[url] == nil then
             DANMAKU.sources[url] = {from = "api_server"}
+            add_source_to_history(url, DANMAKU.sources[url])
             load_danmaku(from_menu)
             return
         end
         save_danmaku_data(data["comments"], url, "api_server")
+        add_source_to_history(url, DANMAKU.sources[url])
         load_danmaku(from_menu)
     else
         show_message("弹幕数据加载不成功，请稍后在选择弹幕源里重试", 3)
@@ -933,6 +954,22 @@ end
 
 function add_danmaku_source_online(query, from_menu)
     set_danmaku_button()
+    if query:find("/api/v2/comment/") or query:find("/api/v2/related/") then
+        show_message("正在加载额外弹幕源...", 30)
+        msg.verbose("添加 API 直链弹幕源：" .. query)
+        
+        local args = make_danmaku_request_args("GET", query)
+        if args == nil then return end
+
+        fetch_danmaku_data(args, function(data)
+            if not data or not data["comments"] then
+                show_message("此源数据为空或无法加载", 3)
+                return
+            end
+            handle_fetched_danmaku(data, query, from_menu)
+        end)
+        return
+    end
     local servers = get_api_servers()
     local base = servers[1]
     for _, s in ipairs(servers) do
@@ -941,7 +978,6 @@ function add_danmaku_source_online(query, from_menu)
             break
         end
     end
-
     local url = base .. "/api/v2/extcomment?url=" .. url_encode(query)
     show_message("弹幕加载中...", 30)
     msg.verbose("尝试获取弹幕：" .. url)

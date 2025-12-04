@@ -262,7 +262,7 @@ local function parse_json_danmaku(json_string, delay_segments)
             end
 
             if params[1] and params[2] and params[3] and params[4] then
-                local base_time = params[1]
+                local base_time = tonumber(params[1]) or 0
                 local delay = get_delay_for_time(delay_segments, base_time)
                 table.insert(danmakus, {
                     time = base_time + delay,
@@ -330,6 +330,7 @@ function parse_danmaku_sources(collection, delays)
         end
     end
     if #all_danmaku == 0 then
+        show_message("未能解析任何弹幕", 3)
         msg.info("未能解析任何弹幕")
         return nil
     end

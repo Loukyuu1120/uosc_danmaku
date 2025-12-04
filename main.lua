@@ -307,6 +307,7 @@ function write_history(episodeid, server)
     if history_json then history = utils.parse_json(history_json) or {} end
 
     if not history[key] then history[key] = {} end
+    local existing_sources = history[key].sources
 
     local fname = mp.get_property('filename/no-ext')
     local episodeNumber = 0
@@ -334,6 +335,9 @@ function write_history(episodeid, server)
         history[key].episodeId = episodeid
     elseif DANMAKU.extra then
         history[key].extra = DANMAKU.extra
+    end
+    if existing_sources then
+        history[key].sources = existing_sources
     end
 
     write_json_file(HISTORY_PATH, history)
@@ -367,14 +371,29 @@ function add_source_to_history(add_url, add_source)
     end
 
     history[key] = history[key] or {}
-    history[key]["sources"] = history[key]["sources"] or {}
-    history[key]["sources"][add_url] = history[key]["sources"][add_url] or {}
+    local src = history[key]["sources"]
+    if type(src) ~= "table" then
+        src = {}
+    else
+        local has_string_key = false
+        for k, _ in pairs(src) do
+            if type(k) == "string" then
+                has_string_key = true
+                break
+            end
+        end
+        if not has_string_key then
+            src = {}
+        end
+    end
+    history[key]["sources"] = src
 
+    history[key]["sources"][add_url] = history[key]["sources"][add_url] or {}
     local record = history[key]["sources"][add_url]
     record.from = add_source.from or "user_custom"
     record.blocked = add_source.blocked or false
 
-   local delay_segments = shallow_copy(add_source.delay_segments or {})
+    local delay_segments = shallow_copy(add_source.delay_segments or {})
     if #delay_segments > 0 then
         record.delay_segments = merge_delay_segments(delay_segments)
         if #record.delay_segments == 0 then
@@ -388,10 +407,14 @@ function add_source_to_history(add_url, add_source)
     write_json_file(HISTORY_PATH, history)
 end
 
-function read_danmaku_source_record()
+
+
+local function read_danmaku_source_record()
     local key = get_cache_key()
     if not key then return nil end
-    local history_json = read_file(HISTORY_PATH) or ""
+    local history = read_file(HISTORY_PATH)
+    if not history then return end
+    local history_json = utils.parse_json(history) or {}
     local record = history_json[key]
     if not record or not record.sources then return end
 
@@ -458,20 +481,300 @@ function read_danmaku_source_record()
 
         if next(upgraded_sources) then
             record.sources = upgraded_sources
-            write_json_file(HISTORY_PATH, history)
+            history_json[key] = record
+            write_json_file(HISTORY_PATH, history_json)
+        end
+    end
+end
+
+-- 重新加载历史弹幕源的实际数据（支持 URL 变更写回 history，应用集数偏移，且同步更新 episode* / fname）
+local function reload_history_danmaku_sources(opts)
+    opts = opts or {}
+    local fname = opts.fname
+    local history_record = opts.history_record
+    local episode_offset = tonumber(opts.episode_offset) or 0   -- x
+    local api_server     = opts.api_server                      -- history_server
+    local target_episode_id = nil
+    if not history_record or not history_record.sources then
+        msg.verbose("reload_history_danmaku_sources: 没有历史 sources 记录")
+        return
+    end
+
+    local pending_sources = {}
+    local upgraded_urls   = {}  -- { [old_url] = new_url }
+
+    local function add_to_number(n, offset)
+        local num = tonumber(n)
+        if not num then return nil end
+        return num + offset
+    end
+
+    local function update_episode_title_with_offset(ep_title, offset)
+        if not ep_title or offset == 0 then return ep_title end
+        local num = get_episode_number(ep_title)
+        
+        if num then
+            local new_num = add_to_number(num, offset)
+            if new_num then
+                return string.format("第%s话", new_num)
+            end
+        end
+        return ep_title
+    end
+
+    for url, src in pairs(DANMAKU.sources) do
+        if src.from_history then
+            local old_url     = url
+            local new_url     = url
+            local keep_source = true
+
+            -- 有集数偏移时，基于 base_eid 计算新 eid
+            if episode_offset ~= 0 then
+                local base_eid = src.base_eid
+
+                -- 如果没有 base_eid，则从当前 URL 解析一次，并记录下来
+                if not base_eid then
+                    local url_old_eid = url:match("/api/v2/comment/(%d+)")
+                    if url_old_eid then
+                        base_eid = tonumber(url_old_eid)
+                        src.base_eid = base_eid
+                        msg.verbose(("记录 base_eid=%s 用于后续偏移: %s"):format(url_old_eid, url))
+                    else
+                        -- 不符合 /api/v2/comment/数字 的源，视作无法对齐集数，丢弃
+                        msg.verbose("历史源 url 未匹配到 /api/v2/comment/数字，丢弃: " .. url)
+                        DANMAKU.sources[url] = nil
+                        keep_source = false
+                    end
+                end
+
+                -- 使用 base_eid + episode_offset 计算新的 eid
+                if keep_source and base_eid then
+                    local new_eid     = base_eid + episode_offset
+                    local new_eid_str = tostring(new_eid)
+
+                    local before_url = new_url
+                    new_url = new_url:gsub("/api/v2/comment/%d+", "/api/v2/comment/" .. new_eid_str, 1)
+                end
+            end
+
+            if keep_source then
+                -- 如果 url 被改写了，迁移记录到新 key
+                if new_url ~= old_url then
+                    DANMAKU.sources[new_url] = DANMAKU.sources[old_url]
+                    DANMAKU.sources[old_url] = nil
+                    upgraded_urls[old_url]   = new_url
+                    src = DANMAKU.sources[new_url]
+                end
+
+                -- 只保留未被 block 且还没加载 data 的源
+                if not src.blocked and not src.data then
+                    table.insert(pending_sources, new_url)
+                end
+            end
+        end
+    end
+    local key = get_cache_key()
+    if key then
+        local history_json = read_file(HISTORY_PATH)
+        if history_json then
+            local history = utils.parse_json(history_json) or {}
+            local record  = history[key]
+
+            if record and record.sources then
+                -- 迁移旧 URL 到新 URL
+                if next(upgraded_urls) ~= nil then
+                    for old_url, new_url in pairs(upgraded_urls) do
+                        local src_data = record.sources[old_url]
+                        if src_data then
+                            if not record.sources[new_url] then
+                                record.sources[new_url] = src_data
+                            end
+                            record.sources[old_url] = nil
+                        end
+                    end
+                end
+                if episode_offset ~= 0 then
+                    -- episodeNumber
+                    if record.episodeNumber then
+                        local new_epnum = add_to_number(record.episodeNumber, episode_offset)
+                        if new_epnum then
+                            msg.verbose(("更新 history.episodeNumber: %s -> %s (x=%d)")
+                                :format(tostring(history_record.episodeNumber), tostring(new_epnum), episode_offset))
+                            record.episodeNumber = new_epnum
+                        end
+                    end
+
+                    -- episodeTitle
+                    if record.episodeTitle then
+                        local new_title = update_episode_title_with_offset(record.episodeTitle, episode_offset)
+                        if new_title ~= record.episodeTitle then
+                            msg.verbose(("更新 history.episodeTitle: %s -> %s")
+                                :format(record.episodeTitle, new_title))
+                            record.episodeTitle = new_title
+                        end
+                    end
+
+                    -- episodeId
+                    if record.episodeId then
+                        local new_eid = add_to_number(record.episodeId, episode_offset)
+                        if new_eid then
+                            msg.verbose(("更新 history.episodeId: %s -> %s (x=%d)")
+                                :format(tostring(history_record.episodeId), tostring(new_eid), episode_offset))
+                            record.episodeId = new_eid
+                        end
+                    end
+
+                    -- fname
+                    if record.fname then
+                        if fname ~= record.fname then
+                            msg.verbose(("更新 history.fname: %s -> %s")
+                                :format(record.fname, fname))
+                            record.fname = fname
+                        end
+                    end
+                end
+
+                if record.episodeId then
+                    target_episode_id = record.episodeId
+                end
+                history[key] = record
+                write_json_file(HISTORY_PATH, history)
+            end
+        end
+    end
+    if not target_episode_id and episodeId then
+        target_episode_id = episodeId
+    end
+    if episode_offset ~= 0 and apply_danmaku_offset_update then
+        apply_danmaku_offset_update(episode_offset, api_server)
+    end
+    if #pending_sources == 0 then
+        msg.verbose("没有需要重新加载的历史弹幕源")
+        return
+    end
+
+    msg.info(string.format("开始重新加载 %d 个历史弹幕源", #pending_sources))
+
+    local loaded_count = 0
+    local total_count  = #pending_sources
+
+    local function check_all_loaded()
+        loaded_count = loaded_count + 1
+        if loaded_count >= total_count then
+            ENABLED = true
+            set_danmaku_visibility(true)
+            set_danmaku_button()
+            show_message("所有历史弹幕源加载完成", 3)
+
+            -- 如果是 dandanplay 服务且开启了 load_more_danmaku，则在此处拉取额外源
+            if api_server
+                and options.load_more_danmaku
+                and api_server:find("api%.dandanplay%.")
+                and target_episode_id
+                and fetch_danmaku_all
+            then
+                local eid_num = tonumber(target_episode_id)
+                if eid_num then
+                    msg.info(("尝试从 dandanplay 加载额外弹幕源: episodeId=%d, api=%s")
+                        :format(eid_num, api_server))
+                    fetch_danmaku_all(eid_num, false, api_server)
+                end
+            end
+
+            -- 历史源全部加载完，再统一重新 parse & render
+            load_danmaku(true, true)
+        end
+    end
+
+    for _, url in ipairs(pending_sources) do
+        local source = DANMAKU.sources[url]
+        if not source or source.blocked then
+            check_all_loaded()
+        else
+            if is_protocol(url) then
+                -- 在线源
+                if url:find("/api/v2/comment/") or url:find("/api/v2/related/") then
+                    msg.verbose("重新加载 API 直链源: " .. url)
+                    local args = make_danmaku_request_args("GET", url)
+                    if args then
+                        call_cmd_async(args, function(error, json)
+                            if not error and json then
+                                local ok, data = pcall(utils.parse_json, json)
+                                if ok and data and data.comments then
+                                    save_danmaku_data(data.comments, url, source.from)
+                                    msg.verbose("成功重新加载: " .. url)
+                                end
+                            end
+                            check_all_loaded()
+                        end)
+                    else
+                        check_all_loaded()
+                    end
+                else
+                    -- 第三方源，通过 extcomment 加载
+                    msg.verbose("重新加载第三方源: " .. url)
+                    local servers = get_api_servers()
+                    local base = servers[1]
+                    for _, s in ipairs(servers) do
+                        if s:find("api%.dandanplay%.") or s:find("/api/v1/") then
+                            base = s
+                            break
+                        end
+                    end
+                    local ext_url = base .. "/api/v2/extcomment?url=" .. url_encode(url)
+                    local args = make_danmaku_request_args("GET", ext_url)
+                    if args then
+                        call_cmd_async(args, function(error, json)
+                            if not error and json then
+                                local ok, data = pcall(utils.parse_json, json)
+                                if ok and data and data.comments then
+                                    save_danmaku_data(data.comments, url, source.from)
+                                    msg.verbose("成功重新加载: " .. url)
+                                end
+                            end
+                            check_all_loaded()
+                        end)
+                    else
+                        check_all_loaded()
+                    end
+                end
+            else
+                -- 本地文件源
+                msg.verbose("重新加载本地源: " .. url)
+                local path = normalize(url)
+                if file_exists(path) then
+                    local temp_collection = {{
+                        type = "file",
+                        path = path,
+                        url  = url
+                    }}
+                    local danmaku_list = parse_danmaku_sources(temp_collection, {})
+                    if danmaku_list and #danmaku_list > 0 then
+                        DANMAKU.sources[url].data = danmaku_list
+                        msg.verbose("成功重新加载: " .. url)
+                    end
+                end
+                check_all_loaded()
+            end
         end
     end
 end
 
 local function get_inherited_delay(target_url, history_record)
     if not history_record or not history_record.sources then return nil end
-    if target_url:find("bilibili%.com/(video/[BbAa][Vv]|combine)") then
+    if target_url:find("/api/v2/comment/") then return nil end
+    if target_url:find("bilibili%.com/video/[BbAa][Vv]") or
+       target_url:find("bilibili%.com/combine")
+    then
         return nil
     end
     local target_domain = target_url:match("https?://([^/]+)")
     if not target_domain then return nil end
     for url, data in pairs(history_record.sources) do
-        if url:find(target_domain, 1, true) and data.delay_segments and #data.delay_segments > 0 then
+        if url:find(target_domain, 1, true)
+            and data.delay_segments
+            and #data.delay_segments > 0
+        then
             return data.delay_segments
         end
     end
@@ -609,40 +912,69 @@ function load_danmaku(from_menu, no_osd)
     if not ENABLED then return end
     local danmaku_collection, delays = collect_danmaku_sources()
 
-    -- 如果弹幕列表为空，进入自动修复/切换流程
-    if #danmaku_collection == 0 then
-        local current_api_url = get_current_server()
-        if current_api_url and not attempted_automatch_urls[current_api_url] then
-
-            attempted_automatch_urls[current_api_url] = true
-
-            msg.info("弹幕为空，尝试调用后台 /api/v2/match 进行匹配修复 (" .. current_api_url .. ")")
-            show_message("弹幕为空，正在尝试后台自动匹配...", 3)
-
-            local file_path = mp.get_property("path")
-            local file_name = mp.get_property("filename")
-            match_file_concurrent(file_path, file_name, function(err)
-                if err then
-                    msg.warn("自动匹配失败: " .. tostring(err))
-                    if not switch_to_next_server(current_api_url) then
-                        show_message("匹配失败且无备用源", 3)
-                    end
-                else
-                    msg.info("自动匹配流程执行成功 (等待数据加载)")
+    local current_api_url = get_current_server()
+    local has_api_server_source = false          -- 有没有任何 api_server 源
+    local has_current_server_source = false      -- 有没有属于 current_api_url 的源
+    local has_current_server_data   = false      -- current_api_url 下有没有 data
+    for url, src in pairs(DANMAKU.sources) do
+        if src.from == "api_server" then
+            has_api_server_source = true
+            if current_api_url and url:find(current_api_url, 1, true) then
+                has_current_server_source = true
+                if src.data ~= nil then
+                    has_current_server_data = true
                 end
-            end, {current_api_url})
+            end
+        end
+    end
+    if #danmaku_collection == 0 and not from_menu then
+        if not has_api_server_source then
+            show_message("当前弹幕源无内容，结束加载", 3)
+            msg.verbose("弹幕列表为空且不存在 api_server 源，不进行自动匹配/切换")
+            COMMENTS = {}
+            return
+        end
+        if current_api_url and not has_current_server_source then
+            msg.verbose("当前 server 下无弹幕源，尝试切换备用 API")
+            if switch_to_next_server(current_api_url) then return end
+            show_message("该集弹幕内容为空，结束加载", 3)
+            COMMENTS = {}
+            return
+        end
+        if current_api_url and not has_current_server_data then
+            if not attempted_automatch_urls[current_api_url] then
+                attempted_automatch_urls[current_api_url] = true
+                msg.info("弹幕为空，尝试调用后台 /api/v2/match 进行匹配修复 (" .. current_api_url .. ")")
+                show_message("弹幕为空，正在尝试后台自动匹配...", 3)
 
+                local file_path = mp.get_property("path")
+                local file_name = mp.get_property("filename")
+                match_file_concurrent(file_path, file_name, function(err)
+                    if err then
+                        msg.warn("自动匹配失败: " .. tostring(err))
+                        if not switch_to_next_server(current_api_url) then
+                            show_message("匹配失败且无备用源", 3)
+                        end
+                    end
+                end, {current_api_url})
+                return
+            end
+
+            -- 已经尝试过自动匹配，再试着切备用 server
+            if switch_to_next_server(current_api_url) then return end
+
+            show_message("该集弹幕内容为空，结束加载", 3)
+            msg.verbose("该集弹幕内容为空，结束加载")
+            COMMENTS = {}
             return
         end
 
-        if current_api_url then
-             if switch_to_next_server(current_api_url) then return end
-        end
-
         show_message("该集弹幕内容为空，结束加载", 3)
-        msg.verbose("该集弹幕内容为空，结束加载")
+        msg.verbose("该集弹幕内容为空（未知情形），结束加载")
         COMMENTS = {}
         return
+    elseif #danmaku_collection == 0 and from_menu then
+        restore_prev_server()
     end
 
     local all_danmaku = parse_danmaku_sources(danmaku_collection, delays)
@@ -650,7 +982,7 @@ function load_danmaku(from_menu, no_osd)
        render_danmaku(all_danmaku, from_menu, no_osd)
     end
 
-    if options.autoload_danmaku_matches and uosc_available then
+    if options.autoload_danmaku_matches and uosc_available and not from_menu then
         mp.add_timeout(0.5, function()
             mp.commandv("script-message", "auto_load_danmaku_matches")
         end)
@@ -847,7 +1179,14 @@ function auto_load_danmaku(path, filename, number)
                     DANMAKU.episode = episode_number and string.format("第%s话", episode_number + x) or history_dir.episodeTitle
                     show_message("自动加载上次匹配的弹幕", 3)
                     msg.verbose("自动加载上次匹配的弹幕")
-                    if history_id then
+                    if history_dir.sources and next(history_dir.sources) ~= nil then
+                        reload_history_danmaku_sources({
+                            fname = fname,
+                            history_record = history_dir,
+                            episode_offset = x,
+                            api_server     = history_server, -- 当前使用的 dandanplay server（若是）
+                        })
+                    elseif history_id then
                         local tmp_id = tostring(x + history_id)
                         set_episode_id(tmp_id, history_server)
                         apply_danmaku_offset_update(x, history_server)
