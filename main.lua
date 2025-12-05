@@ -41,6 +41,7 @@ KEY = table_to_zero_indexed({
     0x1e,0x1f
 })
 local attempted_automatch_urls = {}
+local load_danmaku_timer = nil
 
 PLATFORM = (function()
     local platform = mp.get_property_native("platform")
@@ -307,7 +308,6 @@ function write_history(episodeid, server)
     if history_json then history = utils.parse_json(history_json) or {} end
 
     if not history[key] then history[key] = {} end
-    local existing_sources = history[key].sources
 
     local fname = mp.get_property('filename/no-ext')
     local episodeNumber = 0
@@ -335,9 +335,6 @@ function write_history(episodeid, server)
         history[key].episodeId = episodeid
     elseif DANMAKU.extra then
         history[key].extra = DANMAKU.extra
-    end
-    if existing_sources then
-        history[key].sources = existing_sources
     end
 
     write_json_file(HISTORY_PATH, history)
@@ -512,7 +509,7 @@ local function reload_history_danmaku_sources(opts)
     local function update_episode_title_with_offset(ep_title, offset)
         if not ep_title or offset == 0 then return ep_title end
         local num = get_episode_number(ep_title)
-        
+
         if num then
             local new_num = add_to_number(num, offset)
             if new_num then
@@ -642,8 +639,8 @@ local function reload_history_danmaku_sources(opts)
             end
         end
     end
-    if not target_episode_id and episodeId then
-        target_episode_id = episodeId
+    if not target_episode_id and history_record and history_record.episodeId then
+        target_episode_id = history_record.episodeId
     end
     if episode_offset ~= 0 and apply_danmaku_offset_update then
         apply_danmaku_offset_update(episode_offset, api_server)
@@ -907,8 +904,7 @@ local function switch_to_next_server(current_api_url)
     return false
 end
 
--- 加载弹幕
-function load_danmaku(from_menu, no_osd)
+local function exec_load_danmaku(from_menu, no_osd)
     if not ENABLED then return end
     local danmaku_collection, delays = collect_danmaku_sources()
 
@@ -929,7 +925,6 @@ function load_danmaku(from_menu, no_osd)
     end
     if #danmaku_collection == 0 and not from_menu then
         if not has_api_server_source then
-            show_message("当前弹幕源无内容，结束加载", 3)
             msg.verbose("弹幕列表为空且不存在 api_server 源，不进行自动匹配/切换")
             COMMENTS = {}
             return
@@ -937,7 +932,6 @@ function load_danmaku(from_menu, no_osd)
         if current_api_url and not has_current_server_source then
             msg.verbose("当前 server 下无弹幕源，尝试切换备用 API")
             if switch_to_next_server(current_api_url) then return end
-            show_message("该集弹幕内容为空，结束加载", 3)
             COMMENTS = {}
             return
         end
@@ -987,6 +981,17 @@ function load_danmaku(from_menu, no_osd)
             mp.commandv("script-message", "auto_load_danmaku_matches")
         end)
     end
+end
+
+-- 防抖动加载弹幕
+function load_danmaku(from_menu, no_osd)
+    if load_danmaku_timer then
+        load_danmaku_timer:kill()
+    end
+    load_danmaku_timer = mp.add_timeout(0.2, function()
+        load_danmaku_timer = nil
+        exec_load_danmaku(from_menu, no_osd)
+    end)
 end
 
 -- 加载 B 站弹幕
@@ -1181,7 +1186,7 @@ function auto_load_danmaku(path, filename, number)
                     msg.verbose("自动加载上次匹配的弹幕")
                     if history_dir.sources and next(history_dir.sources) ~= nil then
                         reload_history_danmaku_sources({
-                            fname = fname,
+                            fname = filename,
                             history_record = history_dir,
                             episode_offset = x,
                             api_server     = history_server, -- 当前使用的 dandanplay server（若是）

@@ -20,6 +20,18 @@ local current_menu_state = {
 }
 local menu_index_map = {}
 
+local function get_history_episode_id()
+    local history_json = read_file(HISTORY_PATH)
+    if not history_json then return nil end
+    local history = utils.parse_json(history_json) or {}
+    local key = get_cache_key()
+    local record = history[key]
+    if record and record.episodeId then
+        return record.episodeId
+    end
+    return nil
+end
+
 local function create_menu_props(menu_type, menu_title, items, footnote, menu_cmd, query)
     local menu_props = {
         type = menu_type,
@@ -115,6 +127,36 @@ local function get_current_selected_episode_number(current_episode)
     end
 
     return selection.episodeNumber
+end
+
+local function parse_and_sort_episodes(json, current_episode_num)
+    local success, parsed = pcall(utils.parse_json, json)
+    if not success or not parsed or not parsed.bangumi or not parsed.bangumi.episodes then
+        return nil, "数据格式错误"
+    end
+
+    local episodes = parsed.bangumi.episodes
+
+    -- 按剧集号排序
+    table.sort(episodes, function(a, b)
+        return (tonumber(a.episodeNumber) or 0) < (tonumber(b.episodeNumber) or 0)
+    end)
+
+    current_episode_num = tonumber(current_episode_num) or 1
+    local dynamic_selected_episode = get_current_selected_episode_number(current_episode_num)
+
+    for _, episode in ipairs(episodes) do
+        local ep_num = tonumber(episode.episodeNumber)
+        episode.is_current = false
+
+        if dynamic_selected_episode and ep_num and ep_num == dynamic_selected_episode then
+            episode.is_current = true
+        elseif (not dynamic_selected_episode) and ep_num and ep_num == current_episode_num then
+            episode.is_current = true
+        end
+    end
+
+    return episodes, nil
 end
 
 function get_animes(query)
@@ -415,7 +457,7 @@ function get_animes(query)
     end
 
     if request_count == 0 then
-         local message = "无可用服务器"
+        local message = "无可用服务器"
         current_menu_state.search_id = nil
         if uosc_available then
             local menu_props = create_menu_props(menu_type, menu_title, items, message, menu_cmd, query)
@@ -522,21 +564,15 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query, is_s
         if args then
             call_cmd_async(args, function(error, json)
                 completed_requests = completed_requests + 1
-                local result_data = nil
-                local has_data = false
                 if not error and json then
                     local success, parsed = pcall(utils.parse_json, json)
                     if success and parsed and parsed.bangumi and parsed.bangumi.episodes then
-                        result_data = parsed
-                        has_data = true
                         successful_requests = successful_requests + 1
-                        -- 记录这个服务器的剧集数据
                         all_episodes[server] = {
-                            episodes = parsed.bangumi.episodes,
+                            raw_json = json,
                             count = #parsed.bangumi.episodes,
-                            bangumi = parsed.bangumi
                         }
-                        msg.verbose("服务器 " .. server .. " 返回 " .. #parsed.bangumi.episodes .. " 个剧集")
+                        msg.verbose("服务器 " .. server .. " 返回 " .. #parsed.bangumi.episodes .. "                   个剧集")
                     end
                 end
 
@@ -554,19 +590,23 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query, is_s
                     end
 
                     if best_server and all_episodes[best_server] then
-                        local episodes = all_episodes[best_server].episodes
-                        msg.verbose("✅ 获取到 " .. #episodes .. " 个剧集 (服务器: " .. best_server .. ", 成功: " .. successful_requests .. "/" .. #servers .. ")")
-
-                        -- 按剧集号排序
-                        table.sort(episodes, function(a, b)
-                            return (tonumber(a.episodeNumber) or 0) < (tonumber(b.episodeNumber) or 0)
-                        end)
-
                         -- 获取当前文件信息，用于计算 ⭐ 标记
                         local _, _, current_episode_num = parse_title()
-                        current_episode_num = tonumber(current_episode_num) or 1
+                        local episodes, err = parse_and_sort_episodes(all_episodes[best_server].raw_json, current_episode_num)
+                        if not episodes then
+                            if #items == 1 then
+                                local msg_txt = "获取剧集列表失败"
+                                if uosc_available then
+                                    update_menu_uosc(menu_type, menu_title, items, footnote)
+                                else
+                                    show_message(msg_txt, 3)
+                                end
+                            end
+                            return
+                        end
 
                         -- 计算当前选择的集数（基于 current_menu_state.selected_episode 的偏移）
+                        current_episode_num = tonumber(current_episode_num) or 1
                         local dynamic_selected_episode = get_current_selected_episode_number(current_episode_num)
 
                         for _, episode in ipairs(episodes) do
@@ -821,12 +861,12 @@ function open_content_menu(pos)
     local duration = mp.get_property_number("duration", 0)
     menu_index_map = {}
     if COMMENTS ~= nil then
-        table.sort(COMMENTS, function(a, b) 
+        table.sort(COMMENTS, function(a, b)
             local t1 = a.start_time or a.time or 0
             local t2 = b.start_time or b.time or 0
-            return t1 < t2 
+            return t1 < t2
         end)
-        
+
         local menu_idx = 1
         for real_idx, event in ipairs(COMMENTS) do
             local text = event.clean_text or event.text
@@ -834,18 +874,18 @@ function open_content_menu(pos)
             local end_t = event.end_time or (start_t + 5)
             local delay = get_delay_for_time(DELAYS, start_t)
             local final_start_time = start_t + delay
-            
+
             if text and text ~= "" and final_start_time >= 0 and final_start_time <= duration then
                 menu_index_map[menu_idx] = real_idx
                 local source_url = event.source
                 local source_hint = ""
                 local is_blocked = false
-                
+
                 if source_url then
                     if DANMAKU.sources[source_url] and DANMAKU.sources[source_url].blocked then
                         is_blocked = true
                     end
-                    
+
                     if source_url:find("^http") then
                         source_hint = extract_server_identifier(source_url)
                     elseif source_url:find("^/") or source_url:match("^[a-zA-Z]:") then
@@ -880,14 +920,14 @@ function open_content_menu(pos)
                         icon = 'block',
                         label = '屏蔽此弹幕源',
                     })
-                    
+
                     table.insert(item.actions, {
                         name = 'adjust_delay',
                         icon = 'more_time',
                         label = '调整此源延迟',
                     })
                 end
-                
+
                 table.insert(items, item)
                 menu_idx = menu_idx + 1
             end
@@ -902,7 +942,7 @@ function open_content_menu(pos)
         item_actions_place = "outside",
         callback = {mp.get_script_name(), 'handle-danmaku-content-action'},
     }
-    
+
     local json_props = utils.format_json(menu_props)
     if uosc_available then
         mp.commandv("script-message-to", "uosc", "open-menu", json_props)
@@ -1386,7 +1426,7 @@ mp.register_script_message('setup-danmaku-source', function(json)
                     active_count = active_count + 1
                 end
             end
-            
+
             if active_count <= 1 then
                 show_message("无法屏蔽：至少保留一个弹幕源", 2)
                 return
@@ -1554,21 +1594,11 @@ function restore_prev_server()
     end
 end
 
-local function get_history_episode_id()
-    local history_json = read_file(HISTORY_PATH)
-    if not history_json then return nil end
-    local history = utils.parse_json(history_json) or {}
-    local key = get_cache_key()
-    local record = history[key]
-    if record and record.episodeId then
-        return record.episodeId
-    end
-    return nil
-end
-
 function get_cache_key()
     local title, season_num, episod_num = parse_title()
-    return (title) .. "|" .. tostring(tonumber(season_num))
+    title = title or ""
+    local season = tonumber(season_num) or 0
+    return title .. "|" .. tostring(season)
 end
 
 function get_current_server_from_cache()
@@ -1910,7 +1940,6 @@ local function get_all_servers_matches(file_path, file_name, callback, update_cu
 
             -- 定义处理完成后的回调
             local function finalize_process()
-                local misaka_start = os.clock()
                 -- 处理非 dandanplay 服务器的结果
                 local results = {}
                 for server, server_results in pairs(concurrent_manager.results) do
@@ -2034,9 +2063,9 @@ function search_single_server(server, query)
     current_menu_state.single_server_search_id = (current_menu_state.single_server_search_id or 0) + 1
     local this_search_id = current_menu_state.single_server_search_id
 
-    -- 清理旧的定时器并设置新的自动清理定时器（60秒后过期）
+    -- 清理旧的定时器并设置新的自动清理定时器
     if current_menu_state.single_server_timer then current_menu_state.single_server_timer:kill() end
-    current_menu_state.single_server_timer = mp.add_timeout(60, function()
+    current_menu_state.single_server_timer = mp.add_timeout(30, function()
         if current_menu_state.single_server_search_id == this_search_id then
             current_menu_state.single_server_cache = nil
             current_menu_state.single_server_timer = nil
@@ -2228,19 +2257,21 @@ function search_single_server(server, query)
 end
 
 -- 构建菜单项的函数（支持展开的剧集列表）
-local function build_menu_items_with_expanded(all_results, servers, show_refresh, expanded_key, current_server, loading_key)
+local function build_menu_items_with_expanded(all_results, servers, show_refresh, expanded_key, current_server, loading_key, error_key, error_message)
     local items = {}
     local expanded_server, expanded_anime = nil, nil
     if expanded_key then
         expanded_server, expanded_anime = expanded_key:match("^(.+)|(.+)$")
     end
-    local function get_source_status(target_url)
+    local current_active_episode_id = tonumber(get_history_episode_id())
+
+    local function get_source_status_fuzzy(episode_id)
         if not DANMAKU or not DANMAKU.sources then return nil end
-        if DANMAKU.sources[target_url] then return DANMAKU.sources[target_url] end
-        local target_clean = target_url:gsub("^https?://", ""):gsub("\\", "/")
+        local id_str = tostring(episode_id)
+        local pattern = "/api/v2/comment/" .. id_str
+
         for src_url, src_data in pairs(DANMAKU.sources) do
-            local src_clean = src_url:gsub("^https?://", ""):gsub("\\", "/")
-            if src_clean == target_clean then
+            if src_url:find(pattern, 1, true) then
                 return src_data
             end
         end
@@ -2298,13 +2329,11 @@ local function build_menu_items_with_expanded(all_results, servers, show_refresh
                 local match_hint = ""
                 local danmaku_count = 0
 
-                -- 假装获取弹幕数（实际都没有这个key）
                 if result.danmaku_counts and match.episodeId then
                     local episode_id_str = tostring(match.episodeId)
                     danmaku_count = result.danmaku_counts[episode_id_str] or 0
                 end
 
-                -- 标记当前选中的服务器结果 (⭐ 仅当此服务器的结果被选中为当前播放项时显示)
                 local is_current_server = (server == current_server)
 
                 -- 检查是否有手动选择的剧集信息，用于覆盖显示
@@ -2316,26 +2345,27 @@ local function build_menu_items_with_expanded(all_results, servers, show_refresh
                     display_episode_num = current_menu_state.selected_episode.episodeNumber
                 end
 
-                -- 处理集数显示，如果为空则使用当前文件集数
                 local ep_num_str = display_episode_num
                 if not ep_num_str or ep_num_str == "" then
                     ep_num_str = current_episode_num or "?"
                 end
 
                 if result.match_type == "anime" then
-                    -- 只匹配到番剧，需要再选集数
                     local prefix = is_current_server and "⭐ " or "  └─ "
                     match_title = prefix .. (match.animeTitle or "未知")
                     match_hint = "匹配度 " .. (match.similarity and math.floor(match.similarity * 100) .. "%" or "?")
                 else
-                    -- 直接匹配到了具体集数
                     local is_active = false
                     if is_current_server then
-                        local check_num = tonumber(display_episode_num)
-                        if dynamic_ep_num and check_num == dynamic_ep_num then
-                            is_active = true
-                        elseif (not dynamic_ep_num) and check_num == current_episode_num then
-                            is_active = true
+                        if match.episodeId and current_active_episode_id and tonumber(match.episodeId) == current_active_episode_id then
+                             is_active = true
+                        else
+                            local check_num = tonumber(display_episode_num)
+                            if dynamic_ep_num and check_num == dynamic_ep_num then
+                                is_active = true
+                            elseif (not dynamic_ep_num) and check_num == current_episode_num then
+                                is_active = true
+                            end
                         end
                     end
                     local prefix = is_active and "⭐ " or "  └─ "
@@ -2344,7 +2374,6 @@ local function build_menu_items_with_expanded(all_results, servers, show_refresh
                         (danmaku_count > 0 and (" | " .. danmaku_count .. "条弹幕") or "")
                 end
 
-                -- 主条目：点击切换源
                 table.insert(items, {
                     title = match_title,
                     hint = match_hint,
@@ -2380,6 +2409,16 @@ local function build_menu_items_with_expanded(all_results, servers, show_refresh
                         })
                     end
 
+                    if error_key and error_key == key and error_message then
+                        table.insert(items, {
+                            title = "        ⚠️ " .. error_message,
+                            italic = true,
+                            muted = true,
+                            keep_open = true,
+                            selectable = false
+                        })
+                    end
+
                     -- 展开状态下的剧集列表
                     if is_expanded and current_menu_state.episodes then
                         local apply_dynamic_selection = is_manual_on_this_server or is_current_server
@@ -2389,16 +2428,15 @@ local function build_menu_items_with_expanded(all_results, servers, show_refresh
                             local ep_num = episode.episodeNumber
                             local list_ep_num_str = ep_num or (current_episode_num or "?")
 
-                            -- 构造具体的弹幕 API URL
-                            local comment_url = server .. "/api/v2/comment/" .. episode.episodeId .. "?withRelated=true&chConvert=0"
-                            
-                            -- 使用新的归一化检查函数
-                            local source_info = get_source_status(comment_url)
+                            -- 构造 URL 用于添加，但不用于检测状态
+                            local comment_url_add = server .. "/api/v2/comment/" .. episode.episodeId .. "?withRelated=true&chConvert=0"
+
+                            local source_info = get_source_status_fuzzy(episode.episodeId)
 
                             local status_hint_suffix = ""
                             local item_actions = {}
 
-                            -- 右侧小图标的 action，只传字符串 URL
+                            -- 右侧小图标的 action
                             if source_info then
                                 if source_info.blocked then
                                     status_hint_suffix = " (已屏蔽)"
@@ -2406,16 +2444,15 @@ local function build_menu_items_with_expanded(all_results, servers, show_refresh
                                         name = "unblock",
                                         icon = "check_circle",
                                         label = "解除屏蔽此源",
-                                        value = comment_url
+                                        value = comment_url_add
                                     })
                                 else
-                                    -- 这里修复：如果已加载且未屏蔽，显示对勾或者block图标，并标明已加载
                                     status_hint_suffix = " (已加载)"
                                     table.insert(item_actions, {
                                         name = "block",
                                         icon = "block",
                                         label = "屏蔽此源",
-                                        value = comment_url
+                                        value = comment_url_add
                                     })
                                 end
                             else
@@ -2423,30 +2460,34 @@ local function build_menu_items_with_expanded(all_results, servers, show_refresh
                                     name = "add",
                                     icon = "add_circle",
                                     label = "添加此源 (不切换)",
-                                    value = comment_url
+                                    value = comment_url_add
                                 })
                             end
 
-                            -- 高亮当前集数
                             local is_current_ep = false
-                            local ep_num_val = tonumber(ep_num)
-                            if apply_dynamic_selection and dynamic_ep_num and ep_num_val and ep_num_val == dynamic_ep_num then
+
+                            -- 如果是当前服务器，且 episodeId 与 history 中的一致，则是当前集
+                            if is_current_server and current_active_episode_id and tonumber(episode.episodeId) == current_active_episode_id then
                                 is_current_ep = true
-                            elseif (not apply_dynamic_selection) and ep_num_val and ep_num_val == current_episode_num then
-                                is_current_ep = true
+                            -- 回退到集数偏移逻辑
+                            else
+                                local ep_num_val = tonumber(ep_num)
+                                if apply_dynamic_selection and dynamic_ep_num and ep_num_val and ep_num_val == dynamic_ep_num then
+                                    is_current_ep = true
+                                elseif (not apply_dynamic_selection) and ep_num_val and ep_num_val == current_episode_num then
+                                    is_current_ep = true
+                                end
                             end
 
                             local display_title = "        └─ " .. ep_title
                             if is_current_ep then display_title = "        ⭐ " .. ep_title end
-                            
-                            -- 如果已经加载，将标题变为斜体或加粗以示区别（可选，这里仅修改hint）
+
                             local final_hint = "第" .. list_ep_num_str .. "集" ..
                                 (is_current_ep and " (当前)" or "") .. status_hint_suffix
 
                             table.insert(items, {
                                 title = display_title,
                                 hint = final_hint,
-                                -- 主点击：切换到这一集
                                 value = {
                                     "script-message-to",
                                     mp.get_script_name(),
@@ -2587,6 +2628,115 @@ function open_danmaku_source_menu(force_refresh)
             mp.commandv("script-message-to", "uosc", "update-menu", json_props)
         end)
     end
+end
+
+-- 在当前菜单中展开剧集列表
+local function expand_episodes_in_menu(server, bangumiId, animeTitle, match_json)
+    local endpoint = "/api/v2/bangumi/" .. bangumiId
+    local url = server .. endpoint
+    local args = make_danmaku_request_args("GET", url, nil, nil)
+    if not args then
+        show_message("无法生成请求参数", 3)
+        return
+    end
+
+    -- 唯一键标识
+    local loading_key = server .. "|" .. animeTitle
+
+    -- 显示加载提示
+    if current_menu_state.all_results and current_menu_state.servers then
+        local current_server = get_current_server_from_cache()
+        local loading_items = build_menu_items_with_expanded(
+            current_menu_state.all_results,
+            current_menu_state.servers,
+            true,
+            current_menu_state.expanded_key, -- 保持当前的展开状态，直到加载完成
+            current_server,
+            loading_key -- 传递正在搜索的 key
+        )
+
+        local menu_props = {
+            type = "menu_danmaku_source",
+            title = "选择弹幕源",
+            search_style = "disabled",
+            items = loading_items,
+            item_actions_place = "outside",
+            callback = { mp.get_script_name(), 'handle-danmaku-source-action' },
+        }
+        local json_props = utils.format_json(menu_props)
+        mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+    end
+
+    call_cmd_async(args, function(error, json)
+        local function show_error_in_menu(msg_txt)
+            if not (current_menu_state.all_results and current_menu_state.servers) then
+                show_message(msg_txt, 3)
+                return
+            end
+
+            local current_server = get_current_server_from_cache()
+            -- 传递 loading_key 作为 error_key，在 build_menu_items_with_expanded 中处理
+            local items = build_menu_items_with_expanded(
+                current_menu_state.all_results,
+                current_menu_state.servers,
+                true,
+                current_menu_state.expanded_key,
+                current_server,
+                nil,  -- loading_key 清空
+                loading_key,  -- error_key 参数
+                msg_txt  -- error_message 参数
+            )
+            local menu_props = {
+                type = "menu_danmaku_source",
+                title = "选择弹幕源",
+                search_style = "disabled",
+                items = items,
+                item_actions_place = "outside",
+                callback = { mp.get_script_name(), 'handle-danmaku-source-action' },
+            }
+            local json_props = utils.format_json(menu_props)
+            mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+        end
+        if error or not json then
+            show_error_in_menu("获取剧集列表失败: " .. (error or "未知错误"))
+            return
+        end
+
+        local _, _, current_episode_num = parse_title()
+        local episodes, err = parse_and_sort_episodes(json, current_episode_num)
+        if not episodes then
+            show_error_in_menu("解析剧集列表失败: " .. (err or "未知错误"))
+            return
+        end
+
+        -- 保存展开状态
+        current_menu_state.episodes = episodes
+        current_menu_state.expanded_key = loading_key
+
+        -- 更新菜单
+        if current_menu_state.all_results and current_menu_state.servers then
+            local current_server = get_current_server_from_cache()
+            local items = build_menu_items_with_expanded(
+                current_menu_state.all_results,
+                current_menu_state.servers,
+                true,
+                current_menu_state.expanded_key,
+                current_server,
+                nil -- 加载完成，清除 loading_key
+            )
+
+            local menu_props = {
+                type = "menu_danmaku_source",
+                title = "选择弹幕源",
+                search_style = "disabled",
+                items = items,
+                item_actions_place = "outside",
+                callback = { mp.get_script_name(), 'handle-danmaku-source-action' },
+            }
+            local json_props = utils.format_json(menu_props)
+            mp.commandv("script-message-to", "uosc", "update-menu", json_props)
+        end
+    end)
 end
 
 -- 切换弹幕源
@@ -2739,113 +2889,6 @@ mp.register_script_message("auto_load_danmaku_matches", function()
     end)
 end)
 
--- 在当前菜单中展开剧集列表
-local function expand_episodes_in_menu(server, bangumiId, animeTitle, match_json)
-    local endpoint = "/api/v2/bangumi/" .. bangumiId
-    local url = server .. endpoint
-    local args = make_danmaku_request_args("GET", url, nil, nil)
-    if not args then
-        show_message("无法生成请求参数", 3)
-        return
-    end
-
-    -- 获取当前文件的集数
-    local _, _, current_episode_num = parse_title()
-    current_episode_num = tonumber(current_episode_num) or 1
-
-    -- 唯一键标识
-    local loading_key = server .. "|" .. animeTitle
-
-    -- 显示加载提示
-    if current_menu_state.all_results and current_menu_state.servers then
-        local current_server = get_current_server_from_cache()
-        local loading_items = build_menu_items_with_expanded(
-            current_menu_state.all_results,
-            current_menu_state.servers,
-            true,
-            current_menu_state.expanded_key, -- 保持当前的展开状态，直到加载完成
-            current_server,
-            loading_key -- 传递正在搜索的 key
-        )
-
-        local menu_props = {
-            type = "menu_danmaku_source",
-            title = "选择弹幕源",
-            search_style = "disabled",
-            items = loading_items,
-            item_actions_place = "outside",
-            callback = { mp.get_script_name(), 'handle-danmaku-source-action' },
-        }
-        local json_props = utils.format_json(menu_props)
-        mp.commandv("script-message-to", "uosc", "update-menu", json_props)
-    end
-
-    call_cmd_async(args, function(error, json)
-        if error or not json then
-            show_message("获取剧集列表失败: " .. (error or "未知错误"), 3)
-            return
-        end
-
-        local success, parsed = pcall(utils.parse_json, json)
-        if not success or not parsed or not parsed.bangumi or not parsed.bangumi.episodes then
-            show_message("获取剧集列表失败: 数据格式错误", 3)
-            return
-        end
-
-        local episodes = parsed.bangumi.episodes
-
-        -- 按剧集号排序
-        table.sort(episodes, function(a, b)
-            return (tonumber(a.episodeNumber) or 0) < (tonumber(b.episodeNumber) or 0)
-        end)
-
-        -- 计算当前选择的集数（基于 current_menu_state.selected_episode 的偏移）
-        local dynamic_selected_episode = get_current_selected_episode_number(current_episode_num)
-
-        -- 标记当前集数（如果存在）
-        for _, episode in ipairs(episodes) do
-            local ep_num = tonumber(episode.episodeNumber)
-            episode.is_current = false
-
-            -- 如果用户手动设置了偏移，使用偏移计算的结果进行高亮
-            if dynamic_selected_episode and ep_num and ep_num == dynamic_selected_episode then
-                episode.is_current = true
-            -- 如果没有手动设置偏移（即 dynamic_selected_episode 为 nil），则使用当前播放文件的集数高亮
-            elseif not dynamic_selected_episode and ep_num and ep_num == current_episode_num then
-                episode.is_current = true
-            end
-        end
-
-        -- 保存展开状态
-        current_menu_state.episodes = episodes
-        current_menu_state.expanded_key = loading_key
-
-        -- 更新菜单
-        if current_menu_state.all_results and current_menu_state.servers then
-            local current_server = get_current_server_from_cache()
-            local items = build_menu_items_with_expanded(
-                current_menu_state.all_results,
-                current_menu_state.servers,
-                true,
-                current_menu_state.expanded_key,
-                current_server,
-                nil -- 加载完成，清除 loading_key
-            )
-
-            local menu_props = {
-                type = "menu_danmaku_source",
-                title = "选择弹幕源",
-                search_style = "disabled",
-                items = items,
-                item_actions_place = "outside",
-                callback = { mp.get_script_name(), 'handle-danmaku-source-action' },
-            }
-            local json_props = utils.format_json(menu_props)
-            mp.commandv("script-message-to", "uosc", "update-menu", json_props)
-        end
-    end)
-end
-
 -- 搜索并展开剧集列表（针对非dandanplay API）
 mp.register_script_message("search-and-expand-episodes", function(server, animeTitle, match_json)
     if not uosc_available then
@@ -2997,14 +3040,14 @@ end)
 mp.register_script_message('handle-danmaku-content-action', function(json)
     local event = utils.parse_json(json)
     if not event or event.type ~= 'activate' then return end
-    
+
     if event.action then
         local real_idx = menu_index_map[event.index]
         if not real_idx or not COMMENTS then return end
-        
+
         local d = COMMENTS[real_idx]
         if not d or not d.source then return end
-        
+
         if event.action == "block_source" then
             mp.commandv("script-message", "block-danmaku-source", d.source)
         elseif event.action == "adjust_delay" then
@@ -3140,12 +3183,12 @@ mp.register_script_message('handle-danmaku-source-action', function(json)
                     fetch_danmaku_all(eid_num, false, api_server)
                 end
             end
-            
+
             -- 添加数据需要时间，稍微延时一点刷新
             mp.add_timeout(0.6, function()
                 load_danmaku(true, true)
                 open_danmaku_source_menu(false)
-            end)    
+            end)
         else
             add_source_to_history(server_url, source)
             show_message("该弹幕源已存在", 1)
