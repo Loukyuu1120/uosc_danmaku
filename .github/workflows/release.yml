@@ -35,7 +35,7 @@ jobs:
       - name: Zip project files
         run: |
           FILENAME="${{ github.event.repository.name }}.zip"
-          zip -r "$FILENAME" main.lua modules apis sites dicts README.md LICENSE SYNC_NOTES.md UPSTREAM_AUDIT.md RELEASE_NOTES.md
+          zip -r "$FILENAME" main.lua modules apis sites dicts README.md LICENSE RELEASE_NOTES.md
           echo "打包完成: $FILENAME"
 
       - name: Create Release

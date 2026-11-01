@@ -6,3 +6,7 @@ danmaku/*
 !.github/**
 __pycache__/
 dist/
+
+# Local project notes
+/SYNC_NOTES.md
+/UPSTREAM_AUDIT.md

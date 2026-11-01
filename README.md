@@ -1,7 +1,5 @@
 ## v3.1.0 同步更新（2026-11-02）
 
-基于分叉共同基线 `4d9e54e1`，逐项核查上游至 `d896f17` 的 133 个提交，保留本分支多 API、御坂重试、匹配缓存及分段延迟。功能移植与例外见 [逐提交核查表](UPSTREAM_AUDIT.md)，验证范围见 [同步说明](SYNC_NOTES.md)。
-
 - 默认弹弹 Play 入口使用上游维护代理；官方直连需要有效应用凭证。已有 `api_servers` 配置优先，请自行替换其中失效的官方直连入口。
 - `api_servers` 或 `api_server` 支持逗号分隔和 `|备注`／`#备注`，例如 `https://a.example|主源,https://b.example#备用`；搜索 `番名 @备用` 只查询首个匹配备注的来源。`api_servers` 非空有效列表优先。
 - `auto_fallback_search=yes`：自动匹配最终失败后弹出搜索，每个请求代次至多一次；默认关闭。
@@ -9,22 +7,6 @@
 - 搜索历史支持单条删除。`search_history_limit` 默认 50，0 为不限制；兼容上游 `search_history_size`（非负时优先）。路径留空禁用历史。
 - 兼容 `message_alignment`，优先于原来的 `message_anlignment` 拼写。`show_danmaku_count` 消息可显示当前弹幕数。
 - 新增六站点模块、屏蔽规则编辑、mp.input 样式与延迟菜单、双层渲染及更新失败恢复；默认后备服务同步为 `https://dmku.hls.one`。
-
-# 上游同步与稳定性修复
-
-2026-11-02 补充修复：`load_more_danmaku=yes` 在上游代理下使用合并弹幕接口，避免不支持的 `/related` 返回 404 后中止加载；来源菜单逐个显示结果，并复用正在进行的查询，慢来源不再阻塞已成功来源。
-
-2026-11-01 补充修复：同步上游 `948f64e` 的默认 API 代理 `https://danmaku-api.152468.xyz`。它使用番剧搜索流程，由服务端处理官方鉴权；既有 `api_servers` 配置会覆盖默认值，旧配置中的 `https://api.dandanplay.net` 需替换为代理入口。来源菜单现在区分 HTTP 拒绝访问、超时、TLS 失败和真正的空结果。
-
-本地整合版以 `503174b3` 为基础，选择性移植上游 `d896f17` 的站点、解析、渲染、屏蔽规则和搜索改进。保留本分支的多 API、御坂匹配重试、自动选源、历史及分段延迟、更新来源和发布流程。
-
-修复了切集后旧请求回写、阻塞式等待、失败回调遗漏、内存弹幕重复延迟、显隐状态、哈希排除路径和历史集数等问题。新增站点为爱奇艺、芒果 TV、腾讯视频、优酷；B 站支持分 P；巴哈支持网页 sn 参数。站点接口的真实可用性仍受网络、登录和第三方接口变化影响。
-
-新增配置：`cookie_file`、`request_timeout`、`danmaku_save_path`、`merge_without_style`、`merge_fontsize_growth`、`merge_fontsize_max`、`search_history_path` 和 `search_history_limit`。样式、来源、分源延迟、搜索历史、屏蔽规则菜单支持 uosc 和 mp.input。TXT 屏蔽规则保持原有 Lua 模式语义，同时支持 XML/JSON 屏蔽文件。`title_replace` 支持 JSON 文本和 JSON 文件路径。
-
-安装时将完整插件文件夹命名为 **`uosc_danmaku`**，放入 mpv 的 `scripts` 目录。已有用户可以继续使用原配置；建议先备份配置和历史文件。更新器会校验解压内容、备份旧目录，替换失败时恢复，更新成功后请重启 mpv。
-
-离线回归运行：`python -m pip install -r tests/requirements.txt`，然后 `python tests/run.py`。同步范围、已验证项和仍需播放器实测的清单见 [SYNC_NOTES.md](SYNC_NOTES.md)。
 
 # 🔧 相对原版新增功能说明
 
