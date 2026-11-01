@@ -39,6 +39,10 @@ local function build_mgtv_curl_args(target_url)
         '-H', 'Accept: application/json',
         target_url,
     }
+    if options.cookie_file and options.cookie_file ~= '' then
+        args[#args + 1] = '-b'
+        args[#args + 1] = mp.command_native({'expand-path', options.cookie_file})
+    end
     return args
 end
 
@@ -54,7 +58,7 @@ local function parse_mgtv_segment(out, output_table)
         local mode = 1
         local color = 16777215
         local c_param = string.format('%.2f,%d,%d,25,,,', time_s, color, mode)
-        table.insert(output_table, { c = c_param, m = content })
+        table.insert(output_table, { c = c_param, m = content, user_id = item.uid or item.user_id, user_name = item.username })
     end
 end
 

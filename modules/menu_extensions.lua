@@ -1,4 +1,5 @@
 local utils = require('mp.utils')
+local rule_labels = require('modules/block_rules').labels
 local unpack = unpack or table.unpack
 
 function open_blacklist_menu_uosc(action, index)
@@ -50,7 +51,7 @@ function open_blacklist_menu_uosc(action, index)
     else
         for i, entry in ipairs(state.entries) do
             local hint = state.ext == "txt" and ("#" .. i)
-                or ((entry.enabled and "已启用" or "已停用") .. " · #" .. i)
+                or ((entry.error and '规则无效' or entry.enabled and "已启用" or "已停用") .. " · #" .. i)
             local actions
             if state.ext == "txt" then
                 actions = { { name = "delete", icon = "delete", label = "删除此规则" } }
@@ -63,7 +64,7 @@ function open_blacklist_menu_uosc(action, index)
                 }
             end
             items[#items + 1] = {
-                title = abbr_str(entry.pattern, 60), hint = hint,
+                title = abbr_str(entry.pattern, 60), hint = (rule_labels[entry.kind] or "文本") .. " · " .. hint,
                 muted = state.ext ~= "txt" and not entry.enabled or nil,
                 actions = actions, keep_open = true,
             }
@@ -80,9 +81,9 @@ function open_blacklist_menu_uosc(action, index)
     if state.ext == "txt" then
         hint = "txt：每行一条，支持 lua 正则"
     elseif state.ext == "xml" then
-        hint = 'xml：<item enabled="true">t=词</item>'
+        hint = 't=文本，r=正则，u=用户，c=#颜色'
     else
-        hint = 'json：[{"type":0,"filter":"词","opened":true,"id":1}]'
+        hint = 't=文本，r=正则，u=用户，c=#颜色'
     end
     local footnote = state.exists and not state.parse_failed
         and ("输入屏蔽词回车添加；用条目按钮修改 / 启停 / 删除 ｜ " .. hint)
@@ -112,7 +113,7 @@ function open_blacklist_menu_select()
         push("＋ 添加屏蔽词", "add")
         for i, entry in ipairs(state.entries) do
             local status = state.ext ~= "txt" and (entry.enabled and "[启用] " or "[停用] ") or ""
-            push(status .. abbr_str(entry.pattern, 50), { kind = "entry", index = i })
+            push(status .. "[" .. (rule_labels[entry.kind] or "文本") .. "] " .. abbr_str(entry.pattern, 50), { kind = "entry", index = i })
         end
         if #state.entries > 0 then push("－ 删除条目...", "delete_mode") end
     end

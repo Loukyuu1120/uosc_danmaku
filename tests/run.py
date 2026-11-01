@@ -11,6 +11,8 @@ import subprocess
 import zipfile
 
 from lupa import lua51, lua52, luajit21
+from regex_cases import verify_regex
+from transport import verify_proxy_transport
 
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
@@ -60,13 +62,26 @@ def run_in_fixture(engine, test_root):
         compile_lua(path.read_text(encoding='utf-8'), str(path))
     lua.execute("dofile('main.lua')")
     lua.execute((ROOT / 'tests/regression.lua').read_text(encoding='utf-8'))
-    if engine is luajit21 and os.name == 'nt':
-        verify_windows_updater(lua, test_root)
+    lua.execute((ROOT / 'tests/imports.lua').read_text(encoding='utf-8'))
+    verify_regex(lua)
+    verify_proxy_transport(lua, test_root)
+    if engine is luajit21:
+        verify_updater(lua, test_root)
     print(engine.__name__ + ': all regressions passed')
 
 
-def verify_windows_updater(lua, root):
-    for scenario in ('flat', 'nested', 'incomplete', 'swap_failure'):
+def verify_updater(lua, root):
+    lua.globals().test_platform = 'windows' if os.name == 'nt' else 'linux'
+    lua.execute("""
+        local original_get_property = mp.get_property
+        mp.get_property = function(name, default)
+            if name == 'platform' then return test_platform end
+            return original_get_property(name, default)
+        end
+        package.loaded['modules/update'] = nil
+        require('modules/update')
+    """)
+    for scenario in ('flat', 'nested', 'incomplete', 'missing_dependency', 'corrupt', 'swap_failure'):
         target = root / scenario / 'uosc_danmaku'
         target.mkdir(parents=True)
         (target / 'main.lua').write_text('old version', encoding='utf-8')
@@ -78,18 +93,28 @@ def verify_windows_updater(lua, root):
         download_args = list(lua.globals().pending[download_id]['command']['args'].values())
         archive = Path(download_args[download_args.index('-o') + 1]).resolve()
         assert archive.is_relative_to(root.resolve()), 'test archive escaped fixture directory'
-        with zipfile.ZipFile(archive, 'w') as package:
-            prefix = 'uosc_danmaku/' if scenario == 'nested' else ''
-            required = ['main.lua', 'modules/options.lua', 'modules/render.lua', 'apis/dandanplay.lua']
-            for path in required[:1] if scenario == 'incomplete' else required:
-                package.writestr(prefix + path, 'new version')
+        if scenario == 'corrupt':
+            archive.write_bytes(b'not a ZIP archive')
+        else:
+            with zipfile.ZipFile(archive, 'w') as package:
+                prefix = 'uosc_danmaku/' if scenario == 'nested' else ''
+                required = ['main.lua'] + [p.relative_to(ROOT).as_posix()
+                    for directory in ('modules', 'apis', 'sites', 'dicts')
+                    for p in (ROOT / directory).glob('*.lua')]
+                for path in required[:1] if scenario == 'incomplete' else required:
+                    if scenario == 'missing_dependency' and path == 'modules/regex.lua':
+                        continue
+                    package.writestr(prefix + path, 'new version')
         lua.globals().respond(download_id, '')
         swap_id = len(lua.globals().pending)
         swap_args = list(lua.globals().pending[swap_id]['command']['args'].values())
         if scenario == 'swap_failure':
-            swap_args[-1] = swap_args[-1].replace(
-                'try { Move-Item -LiteralPath $stage -Destination $target }',
-                "try { throw 'simulated swap failure' }")
+            if os.name == 'nt':
+                swap_args[-1] = swap_args[-1].replace(
+                    'try { Move-Item -LiteralPath $stage -Destination $target }',
+                    "try { throw 'simulated swap failure' }")
+            else:
+                swap_args[2] = swap_args[2].replace('if ! mv "$stage" "$target"; then', 'if ! false; then')
         result = subprocess.run(swap_args, capture_output=True, text=True, timeout=30)
         lua.globals().respond(swap_id, result.stdout, result.returncode)
         expected = 'new version' if scenario in ('flat', 'nested') else 'old version'
@@ -97,7 +122,7 @@ def verify_windows_updater(lua, root):
         if scenario in ('flat', 'nested'):
             backups = list(target.parent.glob('uosc_danmaku.backup-*'))
             assert any((p / 'main.lua').is_file() and (p / 'main.lua').read_text() == 'old version' for p in backups)
-    print('Windows updater: flat/nested archives, incomplete archive, and swap rollback passed')
+    print(('Windows' if os.name == 'nt' else 'Unix') + ' updater: flat/nested, corrupt/incomplete/missing dependency, and rollback passed')
 
 
 for runtime in (lua51, lua52, luajit21):

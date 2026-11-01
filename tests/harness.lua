@@ -39,7 +39,7 @@ mp = {
     end,
     add_periodic_timer = function() error('unexpected render polling timer') end,
     command_native = function(command)
-        if command[1] == 'expand-path' then return command[2]:gsub('^~~', test_root) end
+        if command[1] == 'expand-path' then return (command[2]:gsub('^~~', test_root)) end
         if command[1] == 'normalize-path' then return command[2] end
         if command.name == 'subprocess' then error('unexpected blocking subprocess') end
         return ''

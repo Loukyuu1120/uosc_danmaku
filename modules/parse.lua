@@ -69,69 +69,50 @@ function get_blacklist_path()
     return expanded
 end
 
--- 加载黑名单模式
+local block_rules = require('modules/block_rules')
+
+-- Exported files have typed rules. TXT keeps its original Lua-pattern syntax.
 function get_blacklist_patterns(force)
     if blacklist_patterns == nil or force then
         blacklist_patterns = {}
         local path = get_blacklist_path()
         local content = path and file_exists(path) and read_file(path)
+        local entries = {}
         if content then
-            local ext = path:lower():match("%.([a-z]+)$")
-            if content:sub(1, 3) == "\239\187\191" then content = content:sub(4) end
-            if ext == "xml" then
-                -- xml文件格式示例
-                --<?xml version="1.0" encoding="utf-8"?>
-                --<filters>
-                --  <item enabled="true">t=卡在</item>
-                --  <item enabled="true">t=进度条</item>
-                --</filters>
-                for _, line in ipairs(split_lines(content)) do
-                    local enabled, pattern =
-                        line:match('<item%s+enabled="([^"]*)"%s*>t=(.-)</item>')
-                    if enabled == "true" and pattern then
-                        blacklist_patterns[#blacklist_patterns + 1] = xml_unescape(pattern)
-                    end
-                end
-            elseif ext == "json" then
-                -- json文件格式示例
-                -- [{"type":0,"filter":"开门","opened":true,"id":15628936}
-                -- ,{"type":0,"filter":"tony","opened":true,"id":15628939}
-                -- ,{"type":1,"filter":"0+.1","opened":true,"id":15628951}]
-                local data = parse_json_table(content)
-                if type(data) == "table" then
-                    for _, e in ipairs(data) do
-                        if type(e) == 'table' and e.type == 0 and e.opened and type(e.filter) == 'string' then
-                            blacklist_patterns[#blacklist_patterns + 1] = e.filter
-                        end
-                    end
+            content = content:gsub('^\239\187\191', '')
+            local ext = path:lower():match('%.([a-z]+)$')
+            if ext == 'xml' then entries = block_rules.xml_entries(content)
+            elseif ext == 'json' then
+                for _, raw in ipairs(block_rules.json_rows(parse_json_table(content)) or {}) do
+                    local entry = block_rules.from_json(raw)
+                    if entry then entries[#entries + 1] = entry end
                 end
             else
-                -- 文本文件格式示例
-                -- 卡在
-                -- 进度条
                 for _, line in ipairs(split_lines(content)) do
-                    line = line:match("^%s*(.-)%s*$")
-                    if line ~= "" then
-                        blacklist_patterns[#blacklist_patterns + 1] = line
-                    end
+                    line = line:match('^%s*(.-)%s*$')
+                    if line ~= '' then entries[#entries + 1] = {kind = 'lua', pattern = line, enabled = true} end
                 end
+            end
+        end
+        for _, entry in ipairs(entries) do
+            if entry.enabled then
+                local rule, err = block_rules.compile(entry)
+                if rule then blacklist_patterns[#blacklist_patterns + 1] = rule
+                else msg.warn('屏蔽规则未生效：' .. entry.pattern .. '（' .. tostring(err) .. '）') end
             end
         end
     end
     return blacklist_patterns
 end
 
--- 检查字符串是否在黑名单中
-function is_blacklisted(str, patterns)
-    for _, pattern in ipairs(patterns) do
-        local ok, result = pcall(function()
-            return str:match(pattern)
-        end)
-
-        if ok and result then
-            return true, pattern
-        elseif not ok then
-            -- msg.debug("黑名单规则错误，跳过: " .. pattern .. "，错误信息：" .. result)
+function is_blacklisted(text, rules, record)
+    for _, rule in ipairs(rules or {}) do
+        -- Preserve compatibility with callers that supply plain Lua patterns.
+        if type(rule) == 'string' then rule = {kind = 'lua', pattern = rule} end
+        local matched, err = block_rules.matches(rule, text, record)
+        if matched then return true, rule.pattern end
+        if err and not rule.warned then
+            rule.warned = true; msg.warn('屏蔽正则未完成匹配：' .. rule.pattern .. '（' .. err .. '）')
         end
     end
     return false
@@ -202,12 +183,13 @@ function parse_danmaku_sources(collection, delays, raw)
                 local time = type(d) == 'table' and tonumber(d.orig_time or d.time)
                 if time and time == time and math.abs(time) < math.huge and type(d.text) == 'string' then
                     local text = ch_convert_cached(decode_html_entities(d.text))
-                    if raw or not is_blacklisted(text, get_blacklist_patterns()) then
+                    if raw or not is_blacklisted(text, get_blacklist_patterns(), d) then
                         all[#all + 1] = {
                             time = time + lookup(time), orig_time = time,
                             type = tonumber(d.type) or 1, size = tonumber(d.size) or 25,
                             color = tonumber(d.color) or 0xFFFFFF,
                             text = raw and d.text or text, source = item.url,
+                            user_id = d.user_id, user_hash = d.user_hash, user_name = d.user_name,
                         }
                     end
                 end
@@ -384,12 +366,8 @@ function parse_xml_danmaku(xml_string)
         local p_attr = attrs:match('%sp%s*=%s*"([^"]+)"') or attrs:match("%sp%s*=%s*'([^']+)'")
         local text = body:match('^<!%[CDATA%[(.-)%]%]>$') or body
         p_attr = p_attr or ''
-        local params = {}
-        local i = 1
-        for val in p_attr:gmatch("([^,]+)") do
-            params[i] = tonumber(val)
-            i = i + 1
-        end
+        local params = split(p_attr, ',')
+        for i = 1, 4 do params[i] = tonumber(params[i]) end
 
         if params[1] and params[2]  and params[3] and params[4] then
             table.insert(danmakus, {
@@ -397,7 +375,9 @@ function parse_xml_danmaku(xml_string)
                 type = params[2] or 1,
                 size = params[3] or 25,
                 color = params[4] or 0xFFFFFF,
-                text = xml_unescape(text)
+                text = xml_unescape(text),
+                user_hash = params[7] ~= '' and params[7] or nil,
+                user_id = attrs:match(' uid%s*=%s*"([^" ]+)"') or attrs:match(" uid%s*=%s*'([^' ]+)'"),
             })
         end
     end
@@ -425,12 +405,8 @@ function parse_json_danmaku(json_string)
         local text = type(entry) == 'table' and entry.m or ""
         if type(text) ~= 'string' then text = '' end
         if type(c) == "string" then
-            local params = {}
-            local i = 1
-            for val in c:gmatch("([^,]+)") do
-                params[i] = tonumber(val)
-                i = i + 1
-            end
+            local params = split(c, ',')
+            for i = 1, 4 do params[i] = tonumber(params[i]) end
 
             if params[1] and params[2] and params[3] and params[4] then
                 table.insert(danmakus, {
@@ -438,7 +414,10 @@ function parse_json_danmaku(json_string)
                     color = params[2] or 0xFFFFFF,
                     type = params[3] or 1,
                     size = params[4] or 25,
-                    text = text
+                    text = text,
+                    user_id = entry.user_id or entry.userId or entry.uid,
+                    user_hash = entry.user_hash or entry.userHash or entry.hash or (params[5] ~= '' and params[5] or nil) or (params[7] ~= '' and params[7] or nil),
+                    user_name = entry.user_name or entry.username,
                 })
             end
         end
@@ -628,7 +607,12 @@ function convert_danmaku_to_xml(all_danmaku, danmaku_out)
                    :gsub("\"", "&quot;")
                    :gsub("'", "&apos;")
 
-        table.insert(xml, string.format('<d p="%s,%s,%s,%s">%s</d>\n', time, type, size, color, text))
+        local function attribute(value)
+            return tostring(value or ''):gsub('&', '&amp;'):gsub('"', '&quot;'):gsub('<', '&lt;'):gsub('>', '&gt;')
+        end
+        local user_hash = attribute(d.user_hash or '')
+        local uid = d.user_id and (' uid="' .. attribute(d.user_id) .. '"') or ''
+        table.insert(xml, string.format('<d p="%s,%s,%s,%s,0,0,%s,0"%s>%s</d>\n', time, type, size, color, user_hash, uid, text))
     end
     table.insert(xml, '</i>')
     local file = io.open(danmaku_out, "w")

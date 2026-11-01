@@ -185,6 +185,7 @@ local function youku_parse_response(out, server, output_table)
         local color = tonumber(properties.color) or 16777215
         content.c = string.format('%s,%s,%s,25,,,', timepoint, color, 1)
         content.m = d.content or ''
+        content.user_id, content.user_name = d.uid or d.userid, d.username
         table.insert(output_table, content)
         added = added + 1
     end

@@ -58,7 +58,7 @@ local function parse_segment_to_output(seg_json, output_table)
         end
         local mode = 1
         local c_param = string.format('%s,%s,%s,25,,,', time, color, mode)
-        table.insert(output_table, {c = c_param, m = item['content'] or ''})
+        table.insert(output_table, {c = c_param, m = item['content'] or '', user_id = item.user_id or item.uid, user_name = item.username})
     end
 end
 

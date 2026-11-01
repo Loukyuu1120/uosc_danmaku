@@ -967,3 +967,11 @@ function binary_search(tbl, target, key)
     end
     return res
 end
+
+function parse_delay_input(text)
+    local value = tostring(text or ''):gsub('%s+', '')
+    local sign, minutes, seconds = value:match('^(%-?)(%d+)m(%d+)s$')
+    local number = minutes and (tonumber(minutes) * 60 + tonumber(seconds)) or tonumber(value)
+    if sign == '-' then number = -number end
+    if number and number == number and math.abs(number) < math.huge then return number end
+end

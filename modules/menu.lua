@@ -51,7 +51,34 @@ local current_menu_state = {
     single_server_timer = nil, -- 单服务器定时清理器
 }
 local menu_index_map = {}
+local menu_request_epoch, menu_requests = 0, {}
+local function cancel_menu_requests()
+    menu_request_epoch = menu_request_epoch + 1
+    for cancel in pairs(menu_requests) do cancel() end
+    menu_requests = {}
+    current_menu_state.search_id = nil
+    current_menu_state.single_server_search_id = nil
+end
+local function call_menu_async(args, callback)
+    local cancel, completed
+    cancel = call_cmd_async(args, function(...)
+        completed = true
+        if cancel then menu_requests[cancel] = nil end
+        callback(...)
+    end)
+    if not completed then menu_requests[cancel] = true end
+    return cancel
+end
+local function add_menu_timeout(seconds, callback)
+    if seconds >= 30 then return add_playback_timeout(seconds, callback) end
+    local owner = menu_request_epoch
+    return add_playback_timeout(seconds, function() if owner == menu_request_epoch then callback() end end)
+end
+mp.register_script_message('cancel-active-request', function(epoch)
+    if not epoch or tonumber(epoch) == menu_request_epoch then cancel_menu_requests() end
+end)
 mp.register_event('end-file', function()
+    cancel_menu_requests()
     for _, key in ipairs({'timer', 'single_server_timer'}) do
         if current_menu_state[key] then current_menu_state[key]:kill() end
     end
@@ -71,6 +98,11 @@ local function get_history_episode_id()
     return nil
 end
 
+local function with_menu_close(props)
+    props.on_close = {'script-message-to', mp.get_script_name(), 'cancel-active-request', tostring(menu_request_epoch)}
+    return props
+end
+
 local function create_menu_props(menu_type, menu_title, items, footnote, menu_cmd, query)
     local menu_props = {
         type = menu_type,
@@ -82,6 +114,9 @@ local function create_menu_props(menu_type, menu_title, items, footnote, menu_cm
         search_suggestion = query,
         items = items,
     }
+    if menu_type == 'menu_anime' or menu_type == 'menu_episodes' or menu_type == 'menu_single_server_result' then
+        with_menu_close(menu_props)
+    end
     return menu_props
 end
 
@@ -209,6 +244,9 @@ function get_animes(query)
         filter_note = filter_note:match('^%s*(.-)%s*$')
     end
     if query == '' then return end
+    if current_menu_state.search_cached_at and mp.get_time() - current_menu_state.search_cached_at >= 60 then
+        current_menu_state.search_items, current_menu_state.search_query = nil, nil
+    end
     -- 缓存逻辑优化：防止死循环
     local use_cache = false
     if current_menu_state.search_query == original_query and
@@ -227,6 +265,7 @@ function get_animes(query)
     end
 
     if use_cache then
+        cancel_menu_requests()
         local items = current_menu_state.search_items
         -- 统计实际结果数
         local result_count = 0
@@ -244,7 +283,7 @@ function get_animes(query)
         if uosc_available then
             local menu_props = create_menu_props(menu_type, menu_title, items, final_message, menu_cmd, query)
             local json_props = utils.format_json(menu_props)
-            add_playback_timeout(0.05, function()
+            add_menu_timeout(0.05, function()
                 mp.commandv("script-message-to", "uosc", "open-menu", json_props)
             end)
         elseif input_loaded then
@@ -253,6 +292,7 @@ function get_animes(query)
         return
     end
 
+    cancel_menu_requests()
     -- 新搜索，增加唯一ID
     current_menu_state.search_id = (current_menu_state.search_id or 0) + 1
     local this_search_id = current_menu_state.search_id
@@ -265,7 +305,7 @@ function get_animes(query)
 
     -- 定时清理
     if current_menu_state.timer then current_menu_state.timer:kill() end
-    current_menu_state.timer = add_playback_timeout(60, function()
+    current_menu_state.timer = add_menu_timeout(60, function()
         if current_menu_state.search_items == items then
             current_menu_state.search_items, current_menu_state.search_query = nil, nil
             current_menu_state.raw_animes = nil
@@ -280,6 +320,7 @@ function get_animes(query)
     -- 重置状态
     current_menu_state.search_items = items
     current_menu_state.search_query = query
+    current_menu_state.search_cached_at = mp.get_time()
     current_menu_state.raw_animes = {} -- 存储所有服务器返回的原始数据
 
     -- 初始菜单：只有返回和loading
@@ -454,7 +495,7 @@ function get_animes(query)
             local request_func = function(callback)
                 local function execute_request(retry_count)
                     retry_count = retry_count or 0
-                    call_cmd_async(args, function(error, json)
+                    call_menu_async(args, function(error, json)
                         if current_menu_state.search_id ~= this_search_id then return end
                         local result = { success = false, server = server, animes = {}, error = error }
                         local is_still_loading = false
@@ -478,7 +519,7 @@ function get_animes(query)
                         if not result.success and not result.error then result.error = '服务器返回无效搜索数据' end
                         if is_still_loading and retry_count < MAX_RETRIES then
                             update_server_status_item(server, loading_text, loading_type)
-                            add_playback_timeout(3, function()
+                            add_menu_timeout(3, function()
                                 if current_menu_state.search_id == this_search_id then
                                     execute_request(retry_count + 1)
                                 end
@@ -515,7 +556,7 @@ function get_animes(query)
         if uosc_available then
             local menu_props = create_menu_props(menu_type, menu_title, items, message, menu_cmd, query)
             local json_props = utils.format_json(menu_props)
-            add_playback_timeout(0.1, function()
+            add_menu_timeout(0.1, function()
                 mp.commandv("script-message-to", "uosc", "update-menu", json_props)
             end)
         elseif input_loaded then
@@ -546,7 +587,7 @@ function get_animes(query)
                 mp.commandv("script-message-to", "uosc", "update-menu", json_props)
             elseif input_loaded then
                 show_message("", 0)
-                add_playback_timeout(0.1, function() open_menu_select(items) end)
+                add_menu_timeout(0.1, function() open_menu_select(items) end)
             end
         else
             local failures = 0
@@ -576,6 +617,7 @@ function get_animes(query)
 end
 
 function get_episodes(animeTitle, bangumiId, source_server, original_query, is_single_server_mode)
+    cancel_menu_requests()
     local servers = {}
     -- 如果指定了源服务器，优先使用该服务器
     if source_server and source_server ~= "" then
@@ -627,7 +669,7 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query, is_s
         local url = server .. endpoint
         local args = make_danmaku_request_args("GET", url, nil, nil)
         if args then
-            call_cmd_async(args, function(error, json)
+            call_menu_async(args, function(error, json)
                 completed_requests = completed_requests + 1
                 if not error and json then
                     local success, parsed = pcall(parse_json_table, json)
@@ -756,7 +798,7 @@ function get_episodes(animeTitle, bangumiId, source_server, original_query, is_s
                         if uosc_available then
                             update_menu_uosc(menu_type, menu_title, items, footnote, nil, nil, episode_index)
                         elseif input_loaded then
-                            add_playback_timeout(0.1, function()
+                            add_menu_timeout(0.1, function()
                                 open_menu_select(items, nil, episode_index)
                             end)
                         end
@@ -890,12 +932,20 @@ function open_search_history()
     end
 end
 mp.register_script_message('open_search_history', open_search_history)
-mp.register_script_message('search-history-action', function(payload)
+local function handle_search_history_action(payload)
     local event = parse_json_table(payload or '')
     if not event or event.type ~= 'activate' then return end
-    if event.action == 'delete' and type(event.value) == 'table' then
-        delete_search_keyword(event.value[4]); open_search_history()
-    elseif type(event.value) == 'table' then mp.commandv(unpack(event.value)) end
+    local keyword = type(event.value) == 'table' and event.value[4] or event.value
+    if event.action == 'delete' and type(keyword) == 'string' then
+        delete_search_keyword(keyword); open_search_history()
+    elseif type(keyword) == 'string' then
+        mp.commandv('script-message-to', mp.get_script_name(), 'search-anime-event', keyword)
+    end
+end
+mp.register_script_message('search-history-action', handle_search_history_action)
+mp.register_script_message('setup-danmaku-search-history', handle_search_history_action)
+mp.register_script_message('open-latest-menu-anime', function()
+    if current_menu_state.search_query then get_animes(current_menu_state.search_query) else open_input_menu() end
 end)
 
 function open_input_menu_uosc(custom_callback, menu_type_id)
@@ -1006,8 +1056,8 @@ function open_content_menu(pos)
             local text = event.clean_text or event.text
             local start_t = event.start_time or event.time or 0
             local end_t = event.end_time or (start_t + 5)
-            local delay = get_delay_for_time(DELAYS, start_t)
-            local final_start_time = start_t + delay
+            local delay = 0
+            local final_start_time = start_t
 
             if text and text ~= "" and final_start_time >= 0 and final_start_time <= duration then
                 menu_index_map[menu_idx] = real_idx
@@ -1058,7 +1108,7 @@ function open_content_menu(pos)
                     table.insert(item.actions, {
                         name = 'adjust_delay',
                         icon = 'more_time',
-                        label = '调整此源延迟',
+                        label = '从此处调整延迟',
                     })
                 end
 
@@ -1081,9 +1131,48 @@ function open_content_menu(pos)
     if uosc_available then
         mp.commandv("script-message-to", "uosc", "open-menu", json_props)
     elseif input_loaded then
-        open_menu_select(items, true)
+        local titles = {}
+        for i, item in ipairs(items) do titles[i] = '[' .. item.hint .. '] ' .. item.title end
+        input.select({prompt = '弹幕内容:', items = titles, submit = function(index)
+            local item, event = items[index], COMMENTS and COMMENTS[menu_index_map[index]]
+            if not item or not event then return end
+            input.terminate()
+            add_playback_timeout(0.01, function()
+                input.select({prompt = item.title, items = {'跳转到此处', '从此处调整延迟', '屏蔽此弹幕源'}, submit = function(action)
+                    input.terminate()
+                    if action == 1 then mp.commandv(unpack(item.value))
+                    elseif action == 2 then open_delay_from_time(event.source, event.orig_time or event.start_time)
+                    elseif action == 3 then mp.commandv('script-message', 'block-danmaku-source', event.source) end
+                end})
+            end)
+        end})
     end
 end
+
+function open_delay_from_time(source, time)
+    time = tonumber(time)
+    if not time or time ~= time or math.abs(time) == math.huge or not DANMAKU.sources[source] then return end
+    if uosc_available then
+        local props = create_menu_props('menu_delay_from_time', '从该时间起调整弹幕延迟', {},
+            '输入秒数或 XmYs，仅影响所选来源的此处及之后弹幕',
+            {'script-message-to', mp.get_script_name(), 'setup-content-delay', tostring(time), source})
+        mp.commandv('script-message-to', 'uosc', 'open-menu', utils.format_json(props))
+    elseif input_loaded then
+        add_playback_timeout(0.01, function()
+            input.get({prompt = '从此处起延迟（秒 / XmYs）:', submit = function(text)
+                input.terminate()
+                mp.commandv('script-message-to', mp.get_script_name(), 'setup-content-delay', tostring(time), source, text)
+            end})
+        end)
+    end
+end
+mp.register_script_message('open_content_delay_menu', open_delay_from_time)
+mp.register_script_message('setup-content-delay', function(time, source, text)
+    local delay = parse_delay_input(text)
+    if not delay then show_message('请输入有效的延迟秒数或 XmYs', 3); return end
+    mp.commandv('script-message', 'danmaku-delay', tostring(delay), tostring(time), source)
+    if uosc_available then mp.commandv('script-message-to', 'uosc', 'close-menu', 'menu_delay_from_time') end
+end)
 
 local menu_items_config = {
     bold = { title = "粗体", hint = options.bold, original = options.bold,
@@ -1423,6 +1512,7 @@ mp.register_script_message("search-anime-event", function(query)
     end
     local name, class = query:match("^(.-)%s*|%s*(.-)%s*$")
     if name and class then
+        cancel_menu_requests()
         query_extra(name, class)
     else
         get_animes(query)
@@ -1642,33 +1732,19 @@ mp.register_script_message("setup-source-delay", function(query, text)
         if text == nil or text == "" then
             return
         end
-        local newText, _ = text:gsub("%s", "") -- 移除所有空白字符
-        local num = tonumber(newText)
-        local delay_segments = shallow_copy(DANMAKU.sources[query]["delay_segments"] or {})
-        for i = #delay_segments, 1, -1 do
-            if delay_segments[i].start == 0 then
-                table.remove(delay_segments, i)
-            end
-        end
-        if num ~= nil then
-            table.insert(delay_segments, 1, { start = 0, delay = tonumber(num) })
-            DANMAKU.sources[query]["delay_segments"] = delay_segments
-            add_source_to_history(query, DANMAKU.sources[query])
-            mp.commandv("script-message-to", "uosc", "close-menu", "menu_delay")
+        local num = parse_delay_input(text)
+        local source = DANMAKU.sources[query]
+        if not num or not source then show_message('请输入有效的延迟秒数或 XmYs', 3); return end
+        local delay_segments = shallow_copy(source.delay_segments or {})
+        for i = #delay_segments, 1, -1 do if delay_segments[i].start == 0 then table.remove(delay_segments, i) end end
+        delay_segments[#delay_segments + 1] = {start = 0, delay = num}
+        source.delay_segments = delay_segments
+        add_source_to_history(query, source)
+        if uosc_available then
+            mp.commandv('script-message-to', 'uosc', 'close-menu', 'menu_delay')
             danmaku_delay_setup(query)
-            load_danmaku(true, true)
-        elseif newText:match("^%-?%d+m%d+s$") then
-            local minutes, seconds = string.match(newText, "^(%-?%d+)m(%d+)s$")
-            minutes = tonumber(minutes)
-            seconds = tonumber(seconds)
-            if minutes < 0 then seconds = -seconds end
-            table.insert(delay_segments, 1, { start = 0, delay = 60 * minutes + seconds })
-            DANMAKU.sources[query]["delay_segments"] = delay_segments
-            add_source_to_history(query, DANMAKU.sources[query])
-            mp.commandv("script-message-to", "uosc", "close-menu", "menu_delay")
-            danmaku_delay_setup(query)
-            load_danmaku(true, true)
         end
+        load_danmaku(true, true)
     end
 end)
 
@@ -2061,11 +2137,13 @@ end
 
 -- 单个服务器搜索功能
 function search_single_server(server, query)
+    cancel_menu_requests()
     -- 尝试读取缓存
     if current_menu_state.single_server_cache and
        current_menu_state.single_server_cache.server == server and
        current_menu_state.single_server_cache.query == query and
-       current_menu_state.single_server_cache.items then
+       current_menu_state.single_server_cache.items and
+       mp.get_time() - (current_menu_state.single_server_cache.created or 0) < 30 then
 
         local has_loading_item = false
         if current_menu_state.single_server_cache.items then
@@ -2088,8 +2166,8 @@ function search_single_server(server, query)
                 search_style = "disabled",
                 items = items
             }
-            add_playback_timeout(0.05, function()
-                mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(result_props))
+            add_menu_timeout(0.05, function()
+                mp.commandv("script-message-to", "uosc", "open-menu", utils.format_json(with_menu_close(result_props)))
             end)
             return
         end
@@ -2101,7 +2179,7 @@ function search_single_server(server, query)
 
     -- 清理旧的定时器并设置新的自动清理定时器
     if current_menu_state.single_server_timer then current_menu_state.single_server_timer:kill() end
-    current_menu_state.single_server_timer = add_playback_timeout(30, function()
+    current_menu_state.single_server_timer = add_menu_timeout(30, function()
         if current_menu_state.single_server_search_id == this_search_id then
             current_menu_state.single_server_cache = nil
             current_menu_state.single_server_timer = nil
@@ -2133,7 +2211,7 @@ function search_single_server(server, query)
             search_style = "disabled",
             items = loading_items
         }
-        return menu_props
+        return with_menu_close(menu_props)
     end
 
     -- 初次打开菜单
@@ -2148,7 +2226,7 @@ function search_single_server(server, query)
     local function execute_request(retry_count)
         retry_count = retry_count or 0
 
-        call_cmd_async(args, function(error, json)
+        call_menu_async(args, function(error, json)
             -- 检查ID是否匹配，防止旧请求覆盖新请求
             if current_menu_state.single_server_search_id ~= this_search_id then return end
 
@@ -2245,10 +2323,10 @@ function search_single_server(server, query)
                     title = menu_title,
                     items = temp_loading_items
                 }
-                mp.commandv("script-message-to", "uosc", "update-menu", utils.format_json(result_props))
+                mp.commandv("script-message-to", "uosc", "update-menu", utils.format_json(with_menu_close(result_props)))
 
                 -- 3秒后重试
-                add_playback_timeout(3, function()
+                add_menu_timeout(3, function()
                     if current_menu_state.single_server_search_id == this_search_id then
                         execute_request(retry_count + 1)
                     end
@@ -2277,6 +2355,7 @@ function search_single_server(server, query)
                 current_menu_state.single_server_cache = {
                     server = server,
                     query = query,
+                    created = mp.get_time(),
                     items = items
                 }
 
@@ -2285,7 +2364,7 @@ function search_single_server(server, query)
                     title = menu_title,
                     items = items
                 }
-                mp.commandv("script-message-to", "uosc", "update-menu", utils.format_json(result_props))
+                mp.commandv("script-message-to", "uosc", "update-menu", utils.format_json(with_menu_close(result_props)))
             end
         end)
     end
@@ -3040,7 +3119,7 @@ mp.register_script_message('handle-danmaku-content-action', function(json)
         if event.action == "block_source" then
             mp.commandv("script-message", "block-danmaku-source", d.source)
         elseif event.action == "adjust_delay" then
-            mp.commandv("script-message", "open_source_delay_menu", d.source)
+            mp.commandv("script-message", "open_content_delay_menu", d.source, tostring(d.orig_time or d.start_time))
         end
     else
         if event.value then
@@ -3225,3 +3304,5 @@ mp.register_script_message('handle-danmaku-source-action', function(json)
         refresh_menu_delayed()
     end
 end)
+
+mp.register_script_message('open_danmaku_style_menu', function() add_danmaku_setup() end)

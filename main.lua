@@ -1,4 +1,4 @@
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 mp.commandv('script-message', 'uosc_danmaku-version', VERSION)
 
@@ -163,9 +163,12 @@ local function merge_delay_segments(segments)
     return merged
 end
 
-local function set_danmaku_delay(dly, time)
+local function set_danmaku_delay(dly, time, specific_source)
+    if specific_source and not DANMAKU.sources[specific_source] then
+        show_message('弹幕来源已失效，请重新打开菜单', 3); return
+    end
     for url, source in pairs(DANMAKU.sources) do
-        if source.data and not source.blocked then
+        if (not specific_source or url == specific_source) and source.data and not source.blocked then
             source.delay_segments = source.delay_segments or {}
             if dly == 0 then
                 source.delay_segments = {}
@@ -181,16 +184,14 @@ local function set_danmaku_delay(dly, time)
         end
     end
 
-    if dly == 0 then
-        DELAY = 0
-        DELAYS = {}
-    else
-        DELAY = DELAY + dly
+    if not specific_source then
+        if dly == 0 then DELAY, DELAYS = 0, {} else DELAY = DELAY + dly end
     end
 
     if ENABLED and COMMENTS ~= nil then load_danmaku(true, true) end
 
-    show_message('设置弹幕延迟: ' .. string.format("%.1f", DELAY + 1e-10) .. ' s')
+    local shown_delay = specific_source and dly or DELAY
+    show_message((specific_source and '设置此源延迟: ' or '设置弹幕延迟: ') .. string.format('%.1f', shown_delay + 1e-10) .. ' s')
     mp.set_property_native(DELAY_PROPERTY, DELAY)
 end
 
@@ -1116,13 +1117,14 @@ end)
 mp.register_script_message("danmaku-delay", function(...)
     local commands = {...}
     local delay_str, time_str = commands[1], commands[2]
-    local dly = tonumber(delay_str)
-    local time = time_str and tonumber(time_str)
-    if type(dly) ~= "number" then
+    local dly = parse_delay_input(delay_str)
+    local time = time_str and time_str ~= 'nil' and parse_delay_input(time_str) or nil
+    if type(dly) ~= "number" or time_str and time_str ~= 'nil' and not parse_delay_input(time_str) then
         show_message("参数错误：缺少有效的延迟秒数", 3)
         return
     end
-    set_danmaku_delay(dly, time)
+    local source = commands[3]
+    set_danmaku_delay(dly, time, source ~= 'nil' and source or nil)
 end)
 
 mp.register_script_message("show_danmaku_keyboard", function()

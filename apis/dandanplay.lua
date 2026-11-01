@@ -82,7 +82,7 @@ function normalize_danmaku_response(data)
     elseif data.xml then
         local parsed = type(data.xml) == 'string' and parse_xml_danmaku(data.xml) or data.xml
         for _, item in ipairs(type(parsed) == 'table' and parsed or {}) do
-            comments[#comments + 1] = {p = string.format('%.3f,%d,%d', item.time, item.type, item.color), m = item.text}
+            comments[#comments + 1] = {p = string.format('%.3f,%d,%d', item.time, item.type, item.color), m = item.text, user_id = item.user_id, user_hash = item.user_hash, user_name = item.user_name}
         end
     elseif type(data[1]) == 'table' and data[1].p then
         comments = data
@@ -249,7 +249,7 @@ end
 
 -- 回退使用额外的弹幕获取方式
 function get_danmaku_fallback(query)
-    if options.fallback_server == '' then return end
+    if options.fallback_server == '' then show_message('没有可用的弹幕来源', 3); return end
     local url = options.fallback_server:gsub("/+$", "") .. "/?ac=dm&url=" .. url_encode(query)
     msg.verbose("尝试获取弹幕(fallback)：" .. url)
     local args = get_base_curl_args()
@@ -266,10 +266,13 @@ function get_danmaku_fallback(query)
             return
         end
         local data = normalize_danmaku_response(parse_json_table(content))
-        if data and type(data.comments) == 'table' then
+        if data and type(data.comments) == 'table' and #data.comments > 0 then
             save_danmaku_data(data.comments, query, 'user_custom')
+        elseif content:match('^%s*<') and #parse_xml_danmaku(content) > 0 then
+            save_danmaku_memory(query, content, 'user_custom', 'xml')
         else
-            save_danmaku_memory(query, content, "user_custom", "xml")
+            show_message('备用来源没有返回有效弹幕', 3)
+            return
         end
         load_danmaku(true)
     end)
@@ -1012,30 +1015,21 @@ function add_danmaku_source_online(query, from_menu, skip_site)
         if not success then add_danmaku_source_online(query, from_menu, true) end
     end) then return end
     local servers = get_api_servers()
-    local base = servers[1]
-    for _, s in ipairs(servers) do
-        if is_dandanplay_catalog(s) or s:find("/api/v1/") then
-            base = s
-            break
-        end
+    local function request(index, retried)
+        local base = servers[index]
+        if not base then get_danmaku_fallback(query); return end
+        local url = base .. '/api/v2/extcomment?url=' .. url_encode(query)
+        fetch_danmaku_data(make_danmaku_request_args('GET', url), function(data, err)
+            if data and type(data.comments) == 'table' and #data.comments > 0 then
+                save_danmaku_data(data.comments, query, 'user_custom')
+                load_danmaku(from_menu)
+            elseif not err and not retried then
+                add_playback_timeout(2, function() request(index, true) end)
+            else request(index + 1, false) end
+        end, true)
     end
-    local url = base .. "/api/v2/extcomment?url=" .. url_encode(query)
-    show_message("弹幕加载中...", 30)
-    msg.verbose("尝试获取弹幕：" .. url)
-    local args = make_danmaku_request_args("GET", url)
-
-    if args == nil then
-        return
-    end
-
-    fetch_danmaku_data(args, function(data)
-        if not data or not data["comments"] then
-            show_message("此源弹幕无法加载", 3)
-            msg.verbose("此源弹幕无法加载")
-            return
-        end
-        handle_danmaku_data(query, data, from_menu)
-    end)
+    show_message('弹幕加载中...', 30)
+    request(1, false)
 end
 
 -- 将弹幕转换为factory可读的json格式
@@ -1050,6 +1044,9 @@ function save_danmaku_json(comments)
                     time = time + (tonumber(comment.shift) or 0), type = mode,
                     size = 25, color = tonumber(fields[3]) or 0xFFFFFF,
                     text = comment.m:gsub('[%z\1-\8\11\12\14-\31]', ''),
+                    user_id = comment.user_id or comment.userId or comment.uid or (fields[4] ~= '' and fields[4] or nil),
+                    user_hash = comment.user_hash or comment.userHash,
+                    user_name = comment.user_name or comment.username,
                 }
             end
         end

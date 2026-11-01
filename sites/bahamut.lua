@@ -97,7 +97,8 @@ function load_danmaku_for_bahamut(path, callback)
             local c_param = string.format("%s,%s,%s,25,,,", time, color, mode)
             table.insert(output_table, {
                 c = c_param,
-                m = comment["text"]
+                m = comment["text"],
+                user_id = comment.userid or comment.user_id or comment.uid, user_name = comment.name
             })
             end
         end

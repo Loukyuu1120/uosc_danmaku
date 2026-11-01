@@ -49,7 +49,26 @@ function invalidate_playback_requests()
     timers = {}
 end
 
+-- Apply the configured proxy at the subprocess boundary, including update
+-- requests. Copy arguments because the same request can be retried later.
+local function with_curl_proxy(args)
+    local command = tostring(args[1] or ''):gsub('\\', '/'):match('([^/]+)$'):lower()
+    if command ~= 'curl' and command ~= 'curl.exe' then return args end
+    local result, has_proxy = {}, false
+    for i, value in ipairs(args) do
+        result[i] = value
+        if value == '-x' or value == '--proxy' or tostring(value):match('^%-%-proxy=') then has_proxy = true end
+    end
+    if not has_proxy and options and options.proxy and options.proxy ~= '' then
+        -- Insert before a possible -- argument terminator.
+        table.insert(result, 2, options.proxy)
+        table.insert(result, 2, '--proxy')
+    end
+    return result
+end
+
 function call_cmd_async(args, callback, settings)
+    args = with_curl_proxy(args)
     settings = settings or {}
     local owner, done = generation, false
     local id

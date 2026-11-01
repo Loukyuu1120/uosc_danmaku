@@ -68,7 +68,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $stage 'main.lua'))) {
     if ($children.Count -ne 1) { throw 'Invalid update layout' }
     $stage = $children[0].FullName
 }
-foreach ($required in @('main.lua','modules/options.lua','modules/render.lua','apis/dandanplay.lua')) {
+foreach ($required in @('main.lua','modules/aes.lua','modules/base64.lua','modules/blacklist.lua','modules/block_rules.lua','modules/guess.lua','modules/hash.lua','modules/inflate.lua','modules/md5.lua','modules/menu.lua','modules/menu_extensions.lua','modules/options.lua','modules/parse.lua','modules/regex.lua','modules/render.lua','modules/requests.lua','modules/sites.lua','modules/update.lua','modules/utils.lua','apis/dandanplay.lua','apis/extra.lua','sites/bahamut.lua','sites/bilibili.lua','sites/iqiyi.lua','sites/mgtv.lua','sites/tencentvideo.lua','sites/youku.lua','dicts/s2t_chars.lua','dicts/t2s_chars.lua')) {
     if (-not (Test-Path -LiteralPath (Join-Path $stage $required) -PathType Leaf)) { throw 'Incomplete update archive' }
 }
 Move-Item -LiteralPath $target -Destination $backup
@@ -94,7 +94,7 @@ if [ ! -f "$stage/main.lua" ]; then
     [ "$#" -eq 1 ] && [ -d "$1" ]
     stage=$1
 fi
-for required in main.lua modules/options.lua modules/render.lua apis/dandanplay.lua; do
+for required in main.lua modules/aes.lua modules/base64.lua modules/blacklist.lua modules/block_rules.lua modules/guess.lua modules/hash.lua modules/inflate.lua modules/md5.lua modules/menu.lua modules/menu_extensions.lua modules/options.lua modules/parse.lua modules/regex.lua modules/render.lua modules/requests.lua modules/sites.lua modules/update.lua modules/utils.lua apis/dandanplay.lua apis/extra.lua sites/bahamut.lua sites/bilibili.lua sites/iqiyi.lua sites/mgtv.lua sites/tencentvideo.lua sites/youku.lua dicts/s2t_chars.lua dicts/t2s_chars.lua; do
     [ -f "$stage/$required" ]
 done
 mv "$target" "$backup"
