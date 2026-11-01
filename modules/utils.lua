@@ -1,4 +1,12 @@
 local utils = require("mp.utils")
+local unpack = unpack or table.unpack
+
+-- Every plugin JSON protocol expects an object/array, never a scalar.
+function parse_json_table(content)
+    if type(content) ~= 'string' then return nil end
+    local ok, data = pcall(utils.parse_json, content)
+    return ok and type(data) == 'table' and data or nil
+end
 
 -- 简单的英文检测：检查是否包含中文字符
 function is_english(text)
@@ -85,6 +93,8 @@ function get_str_width(text, font_size)
 end
 
 function unicode_to_utf8(unicode)
+    if type(unicode) ~= 'number' or unicode < 0 or unicode > 0x10FFFF or
+        (unicode >= 0xD800 and unicode <= 0xDFFF) then return '\239\191\189' end
     if unicode < 0x80 then
         return string.char(unicode)
     else
@@ -324,18 +334,24 @@ function file_exists(path)
 end
 
 function is_writable(path)
-    local file = io.open(path, "w")
+    local probe = path .. '.write-test-' .. tostring(utils.getpid())
+    if file_exists(probe) then return false end
+    local file = io.open(probe, "w")
     if file then
         file:close()
-        os.remove(path)
+        os.remove(probe)
         return true
     end
     return false
 end
 
 function contains_any(tab, val)
+    val = tostring(val or ''):gsub('\\', '/')
+    if PLATFORM == 'windows' then val = val:lower() end
     for _, element in pairs(tab) do
-        if string.find(val, element) then
+        element = tostring(element):gsub('\\', '/')
+        if PLATFORM == 'windows' then element = element:lower() end
+        if element ~= '' and string.find(val, element, 1, true) then
             return true
         end
     end
@@ -348,6 +364,7 @@ end
 
 --读history 和 写history
 function read_file(file_path)
+    if type(file_path) ~= 'string' or file_path == '' then return nil end
     local file = io.open(file_path, "r") -- 打开文件，"r"表示只读模式
     if not file then
         return nil
@@ -359,21 +376,29 @@ end
 
 -- 应用额外的自定义标题替换规则
 function title_replace(title)
-    local title_replace = utils.parse_json(options.title_replace)
-    if not title_replace then
-        return title
+    if type(title) ~= 'string' then return title end
+    local content = options.title_replace or ''
+    content = content:match('^%s*(.-)%s*$')
+    if content ~= '' and content:sub(1, 1) ~= '[' and content:sub(1, 1) ~= '{' then
+        content = read_file(mp.command_native({'expand-path', content})) or ''
     end
-    for _, v in pairs(title_replace) do
-        for _, indexrules in pairs(v['rules']) do
-            for rule, override in pairs(indexrules) do
-                title = title:gsub(rule, override)
-                        :gsub("[_%.]", " ")
-                        :gsub("^%s*(.-)%s*$", "%1")
-                        :gsub("[@#%.%+%-%%&*_=,/~`]+$", "")
+    local rules = parse_json_table(content)
+    if type(rules) == 'table' then
+        if rules.rules then rules = {rules} end
+        for _, group in ipairs(rules) do
+            for _, entry in ipairs(type(group) == 'table' and group.rules or {}) do
+                if type(entry) == 'table' then
+                    for pattern, replacement in pairs(entry) do
+                        if type(pattern) == 'string' and type(replacement) == 'string' then
+                            local ok, changed = pcall(string.gsub, title, pattern, replacement)
+                            if ok then title = changed end
+                        end
+                    end
+                end
             end
         end
     end
-
+    title = title:gsub('[_%.]', ' '):gsub('^%s*(.-)%s*$', '%1')
     if title and title ~= "" then
         -- 去重复标题段（前半段 + 后半段重复处理）
         local left, right = title:match("^(.*)%s-%-%s-(.*)$")
@@ -396,10 +421,28 @@ function title_replace(title)
 end
 
 function write_json_file(file_path, data)
-    local file = io.open(file_path, "w")
-    if not (file and data) then return end
-    file:write(utils.format_json(data)) -- 将 Lua 表转换为 JSON 并写入
-    file:close()
+    if type(data) ~= 'table' then return false end
+    return write_file(file_path, utils.format_json(data))
+end
+
+function write_file(path, content)
+    if type(path) ~= 'string' or path == '' or type(content) ~= 'string' then return false end
+    local tmp = path .. '.tmp-' .. tostring(utils.getpid())
+    local file = io.open(tmp, 'wb')
+    if not file then return false end
+    local written = file:write(content)
+    local closed = file:close()
+    if not written or not closed then os.remove(tmp); return false end
+    if os.rename(tmp, path) then return true end
+    local backup = path .. '.bak-' .. tostring(utils.getpid())
+    if not file_exists(path) or not os.rename(path, backup) then os.remove(tmp); return false end
+    if not os.rename(tmp, path) then
+        os.rename(backup, path)
+        os.remove(tmp)
+        return false
+    end
+    os.remove(backup)
+    return true
 end
 
 -- 拆分字符串中的字符和数字
@@ -484,7 +527,9 @@ function normalize(path)
             path = mp.command_native({"normalize-path", path})
         else
             local directory = mp.get_property("working-directory", "")
-            path = utils.join_path(directory, path:gsub('^%.[\\/]',''))
+            if not path:match('^[/\\]') and not path:match('^%a:[/\\]') then
+                path = utils.join_path(directory, path:gsub('^%.[\\/]',''))
+            end
             if PLATFORM == "windows" then path = path:gsub("\\", "/") end
         end
         return path
@@ -717,33 +762,7 @@ function number_to_chinese(num)
     return result
 end
 
--- 异步执行命令
--- 同时返回 abort 函数，用于取消异步命令
-function call_cmd_async(args, callback)
-    async_running = true
-    local abort_signal = mp.command_native_async({
-        name = 'subprocess',
-        capture_stderr = true,
-        capture_stdout = true,
-        playback_only = false,
-        args = args,
-    }, function(success, result, error)
-        async_running = false
-        if not success or not result or result.status ~= 0 then
-            local exit_code = (result and result.status or 'unknown')
-            local message = error or (result and result.stdout .. result.stderr) or ''
-            callback('Calling failed. Exit code: ' .. exit_code .. ' Error: ' .. message, {})
-            return
-        end
-
-        local json = result and type(result.stdout) == 'string' and result.stdout or ''
-        return callback(nil, json)
-    end)
-
-    return function()
-        mp.abort_async_command(abort_signal)
-    end
-end
+require('modules/requests')
 
 ------------------------------------------------
 -- 并发请求管理器 (优化版：支持提前返回)
@@ -844,7 +863,11 @@ end
 
 function ConcurrentManager:do_request(server, key, request_func)
     self.active_requests = self.active_requests + 1
+    local completed = false
     request_func(function(result)
+        if completed then return end
+        completed = true
+        result = type(result) == 'table' and result or {error = 'empty result'}
         if self.finished then
             self.active_requests = self.active_requests - 1
             return
@@ -870,4 +893,77 @@ function ConcurrentManager:do_request(server, key, request_func)
             self:do_request(next_request.server, next_request.key, next_request.func)
         end
     end)
+end
+
+
+function positive_integer(value, fallback)
+    value = math.floor(tonumber(value) or fallback)
+    return math.max(1, value)
+end
+
+function hex_to_int_color(hex_color)
+    if type(hex_color) ~= 'string' then return 16777215 end
+    -- 移除颜色代码中的'#'字符
+    hex_color = hex_color:gsub('^#', '')
+    if not hex_color:match("^%x%x%x%x%x%x$") then
+        return 16777215
+    end
+
+    -- 提取R, G, B的十六进制值并转为整数
+    local r = tonumber(hex_color:sub(1, 2), 16)
+    local g = tonumber(hex_color:sub(3, 4), 16)
+    local b = tonumber(hex_color:sub(5, 6), 16)
+
+    -- 计算32位整数值
+    local color_int = (r * 256 * 256) + (g * 256) + b
+
+    return color_int
+end
+
+function color_dist(c1, c2)
+    local r1 = math.floor(c1 / 65536) % 256
+    local g1 = math.floor(c1 / 256) % 256
+    local b1 = c1 % 256
+    local r2 = math.floor(c2 / 65536) % 256
+    local g2 = math.floor(c2 / 256) % 256
+    local b2 = c2 % 256
+    return math.sqrt((r1-r2)^2 + (g1-g2)^2 + (b1-b2)^2)
+end
+
+function split_lines(content)
+    content = tostring(content or "")
+    local lines, pos = {}, 1
+    while pos <= #content do
+        local nl = content:find("[\r\n]", pos)
+        if not nl then
+            lines[#lines + 1] = content:sub(pos)
+            break
+        end
+        lines[#lines + 1] = content:sub(pos, nl - 1)
+        local next_pos = nl + 1
+        if content:sub(nl, nl) == "\r" and content:sub(next_pos, next_pos) == "\n" then
+            next_pos = next_pos + 1
+        end
+        pos = next_pos
+    end
+    return lines
+end
+
+function binary_search(tbl, target, key)
+    if not tbl or #tbl == 0 then return 1 end
+    key = key or function(x) return x end
+    local lo, hi = 1, #tbl
+    local res = #tbl + 1
+    while lo <= hi do
+        local mid = math.floor((lo + hi) / 2)
+        local v = tbl[mid]
+        local val = key(v)
+        if val >= target then
+            res = mid
+            hi = mid - 1
+        else
+            lo = mid + 1
+        end
+    end
+    return res
 end

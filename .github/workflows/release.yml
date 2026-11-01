@@ -9,7 +9,24 @@ permissions:
   contents: write
 
 jobs:
+  regression:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+      - run: python -m pip install -r tests/requirements.txt
+      - run: python tests/run.py
+      - run: git diff --check
+
   build-and-release:
+    needs: regression
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -18,14 +35,15 @@ jobs:
       - name: Zip project files
         run: |
           FILENAME="${{ github.event.repository.name }}.zip"
-          zip -r "$FILENAME" . -x ".github/*" -x ".git/*" -x ".gitignore"
+          zip -r "$FILENAME" main.lua modules apis sites dicts README.md LICENSE SYNC_NOTES.md UPSTREAM_AUDIT.md RELEASE_NOTES.md
           echo "打包完成: $FILENAME"
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ github.ref_name }}
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
           files: ${{ github.event.repository.name }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

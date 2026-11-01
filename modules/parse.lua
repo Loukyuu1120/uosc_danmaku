@@ -10,6 +10,35 @@ local function ass_escape(text)
                :gsub("\n", "\\N")
 end
 
+-- 构建 per-source 的延迟查询函数
+local function make_delay_lookup(source)
+    local segments = nil
+    local prefix = nil
+    if source and source.delay_segments and #source.delay_segments > 0 then
+        segments = {}
+        for i, v in ipairs(source.delay_segments) do segments[i] = v end
+        table.sort(segments, function(a, b) return (a.start or 0) < (b.start or 0) end)
+        prefix = {}
+        local s = 0
+        for i, v in ipairs(segments) do
+            s = s + (v.delay or 0)
+            prefix[i] = s
+        end
+    end
+
+    return function(t)
+        local segs = segments or {}
+        local pre = prefix or {}
+        if #segs == 0 then return 0 end
+        local lo, hi = 1, #segs
+        while lo <= hi do
+            local mid = math.floor((lo + hi) / 2)
+            if (tonumber(segs[mid].start) or 0) <= t then lo = mid + 1 else hi = mid - 1 end
+        end
+        return pre[hi] or 0
+    end
+end
+
 local function xml_unescape(str)
     return str:gsub("&quot;", "\"")
               :gsub("&apos;", "'")
@@ -28,31 +57,69 @@ local function decode_html_entities(text)
     end)
 end
 
--- 加载黑名单模式
-local function load_blacklist_patterns(filepath)
-    local patterns = {}
-    if not file_exists(filepath) then
-        return patterns
-    end
-    local file = io.open(filepath, "r")
-    if not file then
-        msg.error("无法打开黑名单文件: " .. filepath)
-        return patterns
-    end
+-- 黑名单模式状态（惰性初始化，不依赖模块加载顺序）
+local blacklist_patterns = nil
 
-    for line in file:lines() do
-        line = line:match("^%s*(.-)%s*$")
-        if line ~= "" then
-            table.insert(patterns, line)
-        end
-    end
-
-    file:close()
-    return patterns
+function get_blacklist_path()
+    local path = options and options.blacklist_path
+    -- 未指定（空/纯空白）时返回 nil —— nil 即“未配置”：
+    if type(path) ~= "string" or path:match("^%s*$") then return nil end
+    local ok, expanded = pcall(mp.command_native, { "expand-path", path })
+    if not ok or type(expanded) ~= "string" or expanded == "" then return nil end
+    return expanded
 end
 
-local blacklist_file = mp.command_native({ "expand-path", options.blacklist_path })
-local black_patterns = load_blacklist_patterns(blacklist_file)
+-- 加载黑名单模式
+function get_blacklist_patterns(force)
+    if blacklist_patterns == nil or force then
+        blacklist_patterns = {}
+        local path = get_blacklist_path()
+        local content = path and file_exists(path) and read_file(path)
+        if content then
+            local ext = path:lower():match("%.([a-z]+)$")
+            if content:sub(1, 3) == "\239\187\191" then content = content:sub(4) end
+            if ext == "xml" then
+                -- xml文件格式示例
+                --<?xml version="1.0" encoding="utf-8"?>
+                --<filters>
+                --  <item enabled="true">t=卡在</item>
+                --  <item enabled="true">t=进度条</item>
+                --</filters>
+                for _, line in ipairs(split_lines(content)) do
+                    local enabled, pattern =
+                        line:match('<item%s+enabled="([^"]*)"%s*>t=(.-)</item>')
+                    if enabled == "true" and pattern then
+                        blacklist_patterns[#blacklist_patterns + 1] = xml_unescape(pattern)
+                    end
+                end
+            elseif ext == "json" then
+                -- json文件格式示例
+                -- [{"type":0,"filter":"开门","opened":true,"id":15628936}
+                -- ,{"type":0,"filter":"tony","opened":true,"id":15628939}
+                -- ,{"type":1,"filter":"0+.1","opened":true,"id":15628951}]
+                local data = parse_json_table(content)
+                if type(data) == "table" then
+                    for _, e in ipairs(data) do
+                        if type(e) == 'table' and e.type == 0 and e.opened and type(e.filter) == 'string' then
+                            blacklist_patterns[#blacklist_patterns + 1] = e.filter
+                        end
+                    end
+                end
+            else
+                -- 文本文件格式示例
+                -- 卡在
+                -- 进度条
+                for _, line in ipairs(split_lines(content)) do
+                    line = line:match("^%s*(.-)%s*$")
+                    if line ~= "" then
+                        blacklist_patterns[#blacklist_patterns + 1] = line
+                    end
+                end
+            end
+        end
+    end
+    return blacklist_patterns
+end
 
 -- 检查字符串是否在黑名单中
 function is_blacklisted(str, patterns)
@@ -89,22 +156,66 @@ end
 local ch_convert_cache = {}
 local ch_cache_keys = {}
 local ch_cache_max = 5000
+local ch_cache_mode
+local ch_cache_slot = 1
 
 local function ch_convert_cached(text)
     if type(text) ~= "string" or text == "" then return text end
+    if ch_cache_mode ~= options.chConvert then
+        ch_convert_cache, ch_cache_keys = {}, {}
+        ch_cache_mode = options.chConvert
+        ch_cache_slot = 1
+    end
     local cached = ch_convert_cache[text]
     if cached ~= nil then return cached end
 
     local converted = ch_convert(text)
+    local old_key = ch_cache_keys[ch_cache_slot]
+    if old_key then ch_convert_cache[old_key] = nil end
     ch_convert_cache[text] = converted
-    ch_cache_keys[#ch_cache_keys+1] = text
-
-    if #ch_cache_keys > ch_cache_max then
-        local old_key = table.remove(ch_cache_keys, 1)
-        ch_convert_cache[old_key] = nil
-    end
+    ch_cache_keys[ch_cache_slot] = text
+    ch_cache_slot = ch_cache_slot % ch_cache_max + 1
 
     return converted
+end
+
+-- The source records always contain unshifted, unfiltered data. Rebuilding a
+-- style, changing a blacklist or exporting must never modify those records.
+function parse_danmaku_sources(collection, delays, raw)
+    local all = {}
+    for i, item in ipairs(collection or {}) do
+        local data = item.type == 'file' and read_file(item.path) or item.data
+        local parsed = data
+        if type(data) == 'string' then
+            data = data:gsub('^\239\187\191', ''):match('^%s*(.-)%s*$')
+            if data:find('[Events]', 1, true) then
+                parsed = parse_ass_danmaku(data)
+            elseif data:sub(1, 1) == '<' then
+                parsed = parse_xml_danmaku(data)
+            else
+                parsed = parse_json_danmaku(data)
+            end
+        end
+        if type(parsed) == 'table' then
+            local lookup = make_delay_lookup({delay_segments = delays and delays[i]})
+            for _, d in ipairs(parsed) do
+                local time = type(d) == 'table' and tonumber(d.orig_time or d.time)
+                if time and time == time and math.abs(time) < math.huge and type(d.text) == 'string' then
+                    local text = ch_convert_cached(decode_html_entities(d.text))
+                    if raw or not is_blacklisted(text, get_blacklist_patterns()) then
+                        all[#all + 1] = {
+                            time = time + lookup(time), orig_time = time,
+                            type = tonumber(d.type) or 1, size = tonumber(d.size) or 25,
+                            color = tonumber(d.color) or 0xFFFFFF,
+                            text = raw and d.text or text, source = item.url,
+                        }
+                    end
+                end
+            end
+        end
+    end
+    table.sort(all, function(a, b) return a.time < b.time end)
+    return all
 end
 
 -- 合并重复弹幕
@@ -114,14 +225,65 @@ local function merge_duplicate_danmaku(danmakus, threshold)
     local groups = {}
 
     for _, d in ipairs(danmakus) do
-        local key = d.type .. "|" .. d.color .. "|" .. d.text
-        if not groups[key] then groups[key] = {} end
-        table.insert(groups[key], d)
+        local tkey = options.merge_without_style and "any" or tostring(d.type or "")
+        local text = d.text or ""
+
+        groups[text] = groups[text] or {}
+        groups[text][tkey] = groups[text][tkey] or {}
+        table.insert(groups[text][tkey], d)
+    end
+
+    local final_groups = {}
+
+    -- 颜色合并
+    for _, type_groups in pairs(groups) do
+        for _, list in pairs(type_groups) do
+            if options.merge_without_style then
+                table.insert(final_groups, list)
+            else
+                local color_groups = {}
+                -- 利用弹幕同色大量重复的特征，缓存 颜色值 -> color_groups 索引
+                local exact_color_cache = {}
+
+                for _, d in ipairs(list) do
+                    local c = d.color or 16777215
+                    local g_idx = exact_color_cache[c]
+
+                    if g_idx then
+                        -- 命中缓存，直接插入
+                        table.insert(color_groups[g_idx], d)
+                    else
+                        -- 未命中的颜色值，计算它是否落入已有代表颜色的 15 容差范围内
+                        local found = false
+                        for i, cg in ipairs(color_groups) do
+                            if color_dist(cg[1].color or 16777215, c) <= 15 then
+                                table.insert(cg, d)
+                                -- 将该颜色值缓存为这个代表颜色的索引，后续遇到完全相同的颜色值可以直接命中
+                                exact_color_cache[c] = i
+                                found = true
+                                break
+                            end
+                        end
+
+                        -- 超出容差范围的全新颜色代表，开辟新组
+                        if not found then
+                            table.insert(color_groups, {d})
+                            exact_color_cache[c] = #color_groups
+                        end
+                    end
+                end
+
+                for _, cg in ipairs(color_groups) do
+                    table.insert(final_groups, cg)
+                end
+            end
+        end
     end
 
     local merged = {}
+    local abs = math.abs
 
-    for _, group in pairs(groups) do
+    for _, group in ipairs(final_groups) do
         table.sort(group, function(a, b) return a.time < b.time end)
 
         local i = 1
@@ -131,8 +293,8 @@ local function merge_duplicate_danmaku(danmakus, threshold)
             local count = 1
             local j = i + 1
 
-            while j <= #group and math.abs(group[j].time - base.time) <= threshold do
-                table.insert(times, group[j].time)
+            while j <= #group and abs(group[j].time - base.time) <= threshold do
+                times[#times+1] = group[j].time
                 count = count + 1
                 j = j + 1
             end
@@ -152,6 +314,8 @@ local function merge_duplicate_danmaku(danmakus, threshold)
                 color = base.color,
                 text = base.text,
                 source = base.source,
+                orig_time = base.orig_time,
+                merge_count = count,
             }
             if count > 2 or not same_time then
                 danmaku.text = danmaku.text .. string.format("x%d", count)
@@ -208,11 +372,18 @@ local function limit_danmaku(danmakus, limit)
 end
 
 -- 解析 XML 弹幕
-local function parse_xml_danmaku(xml_string, delay_segments)
+function parse_xml_danmaku(xml_string)
     local danmakus = {}
+    if not xml_string then
+        return danmakus
+    end
     -- [^>]* 匹配其他 attributes
     -- %f[^%s] 确保 p= 前面是空白字符
-    for p_attr, text in xml_string:gmatch('<d%s+[^>]*%f[^%s]p="([^"]+)"[^>]*>([^<]+)</d>') do
+    for attributes, body in xml_string:gmatch('<d%s+([^>]-)>(.-)</d>') do
+        local attrs = ' ' .. attributes
+        local p_attr = attrs:match('%sp%s*=%s*"([^"]+)"') or attrs:match("%sp%s*=%s*'([^']+)'")
+        local text = body:match('^<!%[CDATA%[(.-)%]%]>$') or body
+        p_attr = p_attr or ''
         local params = {}
         local i = 1
         for val in p_attr:gmatch("([^,]+)") do
@@ -221,10 +392,8 @@ local function parse_xml_danmaku(xml_string, delay_segments)
         end
 
         if params[1] and params[2]  and params[3] and params[4] then
-            local base_time = params[1]
-            local delay = get_delay_for_time(delay_segments, base_time)
             table.insert(danmakus, {
-                time = base_time + delay,
+                time = params[1],
                 type = params[2] or 1,
                 size = params[3] or 25,
                 color = params[4] or 0xFFFFFF,
@@ -238,21 +407,23 @@ local function parse_xml_danmaku(xml_string, delay_segments)
 end
 
 -- 解析 JSON 弹幕
-local function parse_json_danmaku(json_string, delay_segments)
+function parse_json_danmaku(json_string)
     local danmakus = {}
+    if type(json_string) ~= 'string' then return danmakus end
     if json_string:sub(1, 3) == "\239\187\191" then
         json_string = json_string:sub(4)
     end
 
-    local json = utils.parse_json(json_string)
+    local json = parse_json_table(json_string)
     if not json or type(json) ~= "table" then
         msg.info("JSON 解析失败")
         return danmakus
     end
 
     for _, entry in ipairs(json) do
-        local c = entry.c
-        local text = entry.m or ""
+        local c = type(entry) == 'table' and entry.c
+        local text = type(entry) == 'table' and entry.m or ""
+        if type(text) ~= 'string' then text = '' end
         if type(c) == "string" then
             local params = {}
             local i = 1
@@ -262,10 +433,8 @@ local function parse_json_danmaku(json_string, delay_segments)
             end
 
             if params[1] and params[2] and params[3] and params[4] then
-                local base_time = tonumber(params[1]) or 0
-                local delay = get_delay_for_time(delay_segments, base_time)
                 table.insert(danmakus, {
-                    time = base_time + delay,
+                    time = params[1],
                     color = params[2] or 0xFFFFFF,
                     type = params[3] or 1,
                     size = params[4] or 25,
@@ -279,74 +448,165 @@ local function parse_json_danmaku(json_string, delay_segments)
     return danmakus
 end
 
--- 解析弹幕文件
-function parse_danmaku_sources(collection, delays)
-    local all_danmaku = {}
-
-    for i, item in ipairs(collection) do
-        local parsed = {}
-        local delay_segments = delays and delays[i] or {}
-        local source_url = item.url
-        
-        if item.type == "memory" then
-            if type(item.data) == "string" then
-                local content = item.data
-                if content:match("^<%?xml") or content:match("^<d p=") then
-                    parsed = parse_xml_danmaku(content, delay_segments)
-                elseif content:match("^%[") or content:match("^{") then
-                    parsed = parse_json_danmaku(content, delay_segments)
-                end
-            else
-                local status, copy = pcall(utils.parse_json, utils.format_json(item.data))
-                if status then parsed = copy else parsed = item.data end
-            end
-        elseif item.type == "file" then
-            local path = item.path
-            local content = read_file(path)
-            if content then
-                if path:match("%.xml$") then
-                    parsed = parse_xml_danmaku(content, delay_segments)
-                elseif path:match("%.json$") then
-                    parsed = parse_json_danmaku(content, delay_segments)
-                end
-            end
-        end
-        if parsed and type(parsed) == "table" then
-            for _, d in ipairs(parsed) do
-                local matched, pattern = is_blacklisted(d.text, black_patterns)
-                if not matched then
-                    d.text = ch_convert_cached(d.text)
-                    if source_url then d.source = source_url end
-                    -- 应用延迟
-                    if item.type == "memory" then
-                        local d_delay = get_delay_for_time(delay_segments, d.time)
-                        d.time = d.time + d_delay
-                    end
-                    table.insert(all_danmaku, d)
-                else
-                    -- msg.debug("命中黑名单: " .. pattern)
-                end
-            end
+function parse_ass_danmaku(content)
+    local result = {}
+    local function seconds(value)
+        local h, m, s = value:match('(%d+):(%d+):([%d%.]+)')
+        return h and tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+    end
+    for line in content:gmatch('[^\r\n]+') do
+        local start, style, text = line:match('^Dialogue:%s*[^,]*,([^,]*),[^,]*,([^,]*),[^,]*,[^,]*,[^,]*,[^,]*,[^,]*,(.*)$')
+        local time = start and seconds(start)
+        if time then
+            local mode = (style:upper():find('TOP', 1, true) or text:find('\\an8', 1, true)) and 5 or
+                ((style:upper():find('BTM', 1, true) or text:find('\\an2', 1, true)) and 4 or 1)
+            local bgr = text:match('\\c&H(%x+)&')
+            local color = 0xFFFFFF
+            if bgr and #bgr == 6 then color = tonumber(bgr:sub(5,6) .. bgr:sub(3,4) .. bgr:sub(1,2), 16) end
+            text = text:gsub('{[^}]*}', ''):gsub('\\[Nn]', '\n'):gsub('\\h', ' ')
+            result[#result + 1] = {time = time, type = mode, color = color, size = 25, text = text}
         end
     end
-    if #all_danmaku == 0 then
-        show_message("未能解析任何弹幕", 3)
-        msg.info("未能解析任何弹幕")
-        return nil
-    end
-
-    if options.max_screen_danmaku > 0 and options.merge_tolerance <= 0 then
-        options.merge_tolerance = options.scrolltime
-    end
-
-    -- 按时间排序
-    table.sort(all_danmaku, function(a, b)
-        return a.time < b.time
-    end)
-
-    all_danmaku = merge_duplicate_danmaku(all_danmaku, options.merge_tolerance)
-    return all_danmaku
+    return result
 end
+
+--# 弹幕数组与布局算法 (Danmaku Array & Layout Algorithms)
+local DanmakuArray = {}
+DanmakuArray.__index = DanmakuArray
+
+-- 取整前的对数映射严格递增且严格凹。
+-- 取整后的整数字号单调不减，最大字号用于避免合并数量过大时字号失控。
+function DanmakuArray.get_merged_font_size(base_size, count, growth, max_size)
+    local base = positive_integer(base_size, 1)
+    local n = positive_integer(count, 1)
+    local scale = positive_integer(growth, 8)
+    local maximum = math.max(base, positive_integer(max_size, base))
+    local size = base + math.floor(scale * math.log(n) + 0.5)
+    return math.min(maximum, size)
+end
+
+function DanmakuArray:new(max_y)
+    local obj = {
+        max_y = positive_integer(max_y, 1),
+        danmakus = {},
+    }
+    setmetatable(obj, self)
+    return obj
+end
+
+-- 弹幕按出现时间递增的顺序处理。滚动弹幕完全移出屏幕后，或固定弹幕的
+-- 显示时间结束后，它便不可能与当前及之后的弹幕碰撞，因此可以安全删除。
+function DanmakuArray:remove_expired(now)
+    for i = #self.danmakus, 1, -1 do
+        if self.danmakus[i].end_time <= now then
+            table.remove(self.danmakus, i)
+        end
+    end
+end
+
+local function y_intersects(y1, height1, y2, height2)
+    return y1 < y2 + height2 and y2 < y1 + height1
+end
+
+local function rolling_danmaku_collides(previous, start_time, velocity)
+    local delta_velocity = velocity - previous.velocity
+    local delta_x = (start_time - previous.start_time) * previous.velocity - previous.length
+
+    -- delta_x 小于 0 表示旧弹幕尾部尚未进入屏幕，新弹幕出现时会直接重叠。
+    if delta_x < 0 then
+        return true
+    end
+
+    -- 新弹幕速度不大于旧弹幕时，不会缩短已有的 delta_x 间距。
+    if delta_velocity <= 0 then
+        return false
+    end
+
+    -- 比较从新弹幕出现开始的追尾时间与旧弹幕的剩余显示时间；
+    -- 只有在旧弹幕离屏前追上它，才会发生碰撞。
+    local delta_time = delta_x / delta_velocity
+    local remaining_time = previous.end_time - start_time
+    return delta_time < remaining_time
+end
+
+-- 从 y 轴顶部开始寻找可插入位置。对于每个候选位置，只检查 y 轴区间
+-- 与新弹幕相交的已有弹幕；若其中存在碰撞，则跳到碰撞区间下方继续寻找。
+local function find_y_from_top(array, height, collides)
+    local y = 1
+    while y + height - 1 <= array.max_y do
+        local next_y = nil
+        for _, danmaku in ipairs(array.danmakus) do
+            if y_intersects(y, height, danmaku.y, danmaku.height) and collides(danmaku) then
+                local below = danmaku.y + danmaku.height
+                next_y = next_y and math.max(next_y, below) or below
+            end
+        end
+        if not next_y then return y end
+        y = next_y
+    end
+    return nil
+end
+
+-- 从 y 轴顶部开始寻找滚动弹幕的位置，并记录成功插入的弹幕所占区间。
+function DanmakuArray:get_position_y(start_time, length, height, resolution_x, duration)
+    height = positive_integer(height, 1)
+    length = math.max(0, tonumber(length) or 0)
+    resolution_x = math.max(1, tonumber(resolution_x) or 1)
+    duration = math.max(0.001, tonumber(duration) or 0.001)
+    self:remove_expired(start_time)
+
+    local velocity = (length + resolution_x) / duration
+    local y = find_y_from_top(self, height, function(previous)
+        return rolling_danmaku_collides(previous, start_time, velocity)
+    end)
+    if not y then return nil end
+
+    self.danmakus[#self.danmakus + 1] = {
+        y = y,
+        height = height,
+        start_time = start_time,
+        end_time = start_time + duration,
+        length = length,
+        velocity = velocity,
+    }
+    return y
+end
+
+-- 顶部固定弹幕自上而下寻找位置，底部固定弹幕则自下而上寻找位置。
+function DanmakuArray:get_fixed_y(start_time, height, duration, from_top)
+    height = positive_integer(height, 1)
+    duration = math.max(0.001, tonumber(duration) or 0.001)
+    self:remove_expired(start_time)
+
+    local y
+    if from_top then
+        y = find_y_from_top(self, height, function() return true end)
+    else
+        y = self.max_y - height + 1
+        while y >= 1 do
+            local next_y = nil
+            for _, danmaku in ipairs(self.danmakus) do
+                if y_intersects(y, height, danmaku.y, danmaku.height) then
+                    local above = danmaku.y - height
+                    next_y = next_y and math.min(next_y, above) or above
+                end
+            end
+            if not next_y then break end
+            y = next_y
+        end
+        if y < 1 then y = nil end
+    end
+
+    if not y then return nil end
+    self.danmakus[#self.danmakus + 1] = {
+        y = y,
+        height = height,
+        start_time = start_time,
+        end_time = start_time + duration,
+    }
+    return y
+end
+
 
 function convert_danmaku_to_xml(all_danmaku, danmaku_out)
    if not all_danmaku or #all_danmaku == 0 then
@@ -380,4 +640,123 @@ function convert_danmaku_to_xml(all_danmaku, danmaku_out)
     file:close()
     msg.info("保存 XML 弹幕文件成功: " .. danmaku_out)
     return true
+end
+function convert_danmaku_to_ass_events(danmakus)
+    local threshold = tonumber(options.merge_tolerance) or -1
+    danmakus = merge_duplicate_danmaku(danmakus or {}, threshold)
+    if #danmakus == 0 then COMMENTS = {}; return end
+    local fontsize = tonumber(options.fontsize) or 50
+    local fontsize_growth = tonumber(options.merge_fontsize_growth) or 8
+    local fontsize_max = tonumber(options.merge_fontsize_max) or 100
+    local scrolltime = tonumber(options.scrolltime) or 15
+    local fixtime = tonumber(options.fixtime) or 5
+
+    local res_x = 1920
+    local res_y = 1080
+
+    local display_height = math.max(1, math.floor(res_y * (tonumber(options.displayarea) or 1)))
+    local roll_array = DanmakuArray:new(display_height)
+    local fixed_array = DanmakuArray:new(display_height)
+
+    -- 预处理弹幕，先计算时间段以便进行数量限制
+    local pre_events = {}
+    for _, d in ipairs(danmakus) do
+        local time = d.time
+        local orig_time = d.orig_time or d.time
+        local appear_time = time
+        local danmaku_type = d.type
+
+        local end_time = nil
+        if danmaku_type >= 1 and danmaku_type <= 3 then
+            end_time = appear_time + scrolltime
+        elseif danmaku_type == 5 or danmaku_type == 4 then
+            end_time = appear_time + fixtime
+        end
+
+        if end_time then
+            table.insert(pre_events, {orig_time = orig_time, start_time = appear_time, end_time = end_time, danmaku = d})
+        end
+    end
+
+    if options.max_screen_danmaku > 0 then
+        pre_events = limit_danmaku(pre_events, options.max_screen_danmaku)
+    end
+
+    local ass_events = {}
+    for _, ev in ipairs(pre_events) do
+        local d = ev.danmaku
+        local appear_time = ev.start_time
+        local danmaku_type = d.type
+        local clean_text = d.text
+        local text = ass_escape(clean_text)
+                    :gsub("x(%d+)$", "{\\b1\\i1}x%1")
+        local event_fontsize = DanmakuArray.get_merged_font_size(
+            fontsize, d.merge_count or 1, fontsize_growth, fontsize_max
+        )
+
+        -- 颜色从十进制转为 BGR Hex
+        local color = math.max(0, math.min(d.color or 0xFFFFFF, 0xFFFFFF))
+        local color_hex = string.format("%06X", color)
+        local r = string.sub(color_hex, 1, 2)
+        local g = string.sub(color_hex, 3, 4)
+        local b = string.sub(color_hex, 5, 6)
+        local color_text = string.format("{\\c&H%s%s%s&}", b, g, r)
+
+        local style, effect
+        local pos, move = nil, nil
+
+        -- 滚动弹幕 (类型 1, 2, 3)
+        if danmaku_type >= 1 and danmaku_type <= 3 then
+            style = "R2L"
+            local text_length = get_str_width(clean_text, event_fontsize)
+            local x1 = res_x + text_length / 2
+            local x2 = -text_length / 2
+            local y = roll_array:get_position_y(appear_time, text_length, event_fontsize, res_x, scrolltime)
+            if y then
+                effect = string.format("{\\move(%d, %d, %d, %d)}", x1, y, x2, y)
+                move = {x1, y, x2, y}
+            end
+
+        -- 顶部弹幕 (类型 5)
+        elseif danmaku_type == 5 then
+            style = "TOP"
+            local x = res_x / 2
+            local y = fixed_array:get_fixed_y(appear_time, event_fontsize, fixtime, true)
+            if y then
+                effect = string.format("{\\pos(%d, %d)}", x, y)
+                pos = {x, y}
+            end
+
+        -- 底部弹幕 (类型 4)
+        elseif danmaku_type == 4 then
+            style = "BTM"
+            local x = res_x / 2
+            local y = fixed_array:get_fixed_y(appear_time, event_fontsize, fixtime, false)
+            if y then
+                effect = string.format("{\\pos(%d, %d)}", x, y)
+                pos = {x, y}
+            end
+        end
+
+        if style and effect then
+            text = effect .. color_text .. text
+            local event = {
+                orig_time = ev.orig_time,
+                start_time = ev.start_time,
+                end_time = ev.end_time,
+                delay = ev.start_time - (ev.orig_time or ev.start_time),
+                style = style,
+                text = text,
+                clean_text = clean_text,
+                pos = pos,
+                move = move,
+                layer = (style == "R2L") and 0 or 1,
+                source = d.source,
+                font_size = event_fontsize,
+                merge_count = d.merge_count or 1,
+            }
+            table.insert(ass_events, event)
+        end
+    end
+    COMMENTS = ass_events
 end

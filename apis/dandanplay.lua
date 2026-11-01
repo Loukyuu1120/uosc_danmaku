@@ -1,6 +1,15 @@
 local msg = require('mp.msg')
 local utils = require("mp.utils")
 
+function is_official_dandanplay_server(url)
+    return type(url) == 'string' and url:match('^https?://([^/:]+)') == 'api.dandanplay.net'
+end
+
+function is_dandanplay_catalog(url)
+    return is_official_dandanplay_server(url) or
+        (type(url) == 'string' and url:match('^https?://([^/:]+)') == 'danmaku-api.152468.xyz')
+end
+
 local function extract_url(url)
     local path = url:match("^https?://[^/]+(/[^%?]*)")
     return path
@@ -32,10 +41,13 @@ function get_base_curl_args()
     local args = {
         "curl",
         "-L",
-        "-s",
+        "-sS",
         "--compressed",
         "--user-agent", options.user_agent,
-        "--max-time", "20",
+        "--connect-timeout", "10",
+        "--max-time", tostring(options.request_timeout),
+        "--fail",
+        "--write-out", "\n__UOSC_HTTP_STATUS__:%{http_code}",
         "-H", "accept: application/json",
     }
 
@@ -43,8 +55,41 @@ function get_base_curl_args()
         table.insert(args, '-x')
         table.insert(args, options.proxy)
     end
+    if options.cookie_file ~= '' then
+        args[#args + 1] = '-b'
+        args[#args + 1] = mp.command_native({'expand-path', options.cookie_file})
+    end
 
     return args
+end
+
+function normalize_danmaku_response(data)
+    if type(data) ~= 'table' then return nil end
+    if type(data.data) == 'table' and (data.data.comments or data.data.danmuku or data.data.xml) then data = data.data end
+    if type(data.comments) == 'table' then data.count = #data.comments; return data end
+    local comments = {}
+    if type(data.danmuku) == 'table' then
+        for _, item in ipairs(data.danmuku) do
+            if type(item) == 'table' then
+                local time, text = tonumber(item[1]), item[5] or item[4]
+                if time and type(text) == 'string' then
+                    local mode = item[2] == 'top' and 5 or (item[2] == 'bottom' and 4 or 1)
+                    local color = tonumber(item[3]) or hex_to_int_color(item[3])
+                    comments[#comments + 1] = {p = string.format('%.3f,%d,%d', time, mode, color), m = text}
+                end
+            end
+        end
+    elseif data.xml then
+        local parsed = type(data.xml) == 'string' and parse_xml_danmaku(data.xml) or data.xml
+        for _, item in ipairs(type(parsed) == 'table' and parsed or {}) do
+            comments[#comments + 1] = {p = string.format('%.3f,%d,%d', item.time, item.type, item.color), m = item.text}
+        end
+    elseif type(data[1]) == 'table' and data[1].p then
+        comments = data
+    else
+        return data
+    end
+    return {comments = comments, count = #comments}
 end
 
 -- 并发请求多个API服务器
@@ -66,7 +111,7 @@ local function make_concurrent_danmaku_request(servers, request_config, response
                     }
 
                     if not error and json then
-                        local success, parsed = pcall(utils.parse_json, json)
+                        local success, parsed = pcall(parse_json_table, json)
                         if success then
                             result.data = parsed
                         else
@@ -115,17 +160,47 @@ local function parse_servers(servers_str)
 end
 
 -- 获取API服务器列表
-function get_api_servers()
-    if options.api_servers and options.api_servers ~= "" then
-        return parse_servers(options.api_servers)
-    else
-        return {options.api_server}
+function get_api_server_list(value)
+    local result, seen = {}, {}
+    for _, entry in ipairs(parse_servers(value or '')) do
+        local url, note = entry:match('^(.-)[|#](.*)$')
+        url = (url or entry):match('^%s*(.-)%s*$'):gsub('/+$', '')
+        note = note and note:match('^%s*(.-)%s*$') or ''
+        if url:match('^https?://[^/]+') and not seen[url] then
+            result[#result + 1], seen[url] = {url = url, note = note}, true
+        end
+    end
+    return result
+end
+
+function get_configured_api_servers()
+    local entries = get_api_server_list(options.api_servers)
+    if #entries == 0 then entries = get_api_server_list(options.api_server) end
+    if #entries == 0 then entries = {{url = 'https://danmaku-api.152468.xyz', note = ''}} end
+    return entries
+end
+
+function get_api_servers(filter_note)
+    local servers = {}
+    for _, entry in ipairs(get_configured_api_servers()) do
+        if filter_note and entry.note == filter_note then return {entry.url} end
+        servers[#servers + 1] = entry.url
+    end
+    if filter_note then show_message('未找到备注为【' .. filter_note .. '】的服务器，将使用全部服务器', 3) end
+    return servers
+end
+
+function get_api_server_note(url)
+    for _, entry in ipairs(get_configured_api_servers()) do
+        if entry.url == url and entry.note ~= '' then return entry.note end
     end
 end
 
 -- 读取episodeId获取danmaku
 function set_episode_id(input, target_server, from_menu)
     from_menu = from_menu or false
+    if from_menu then set_danmaku_visibility(true) end
+    invalidate_playback_requests()
     DANMAKU.source = "dandanplay"
     for url, source in pairs(DANMAKU.sources) do
         if source.from == "api_server" then
@@ -141,7 +216,7 @@ function set_episode_id(input, target_server, from_menu)
     if key then
         local history_json = read_file(HISTORY_PATH)
         if history_json then
-            local history = utils.parse_json(history_json) or {}
+            local history = parse_json_table(history_json) or {}
             if history[key] and history[key].sources then
                 local cleaned_count = 0
                 local new_sources = {}
@@ -164,7 +239,7 @@ function set_episode_id(input, target_server, from_menu)
             fetch_danmaku(episodeId, from_menu, s)
         end
     else
-        if options.load_more_danmaku and server:find("api%.dandanplay%.") then
+        if options.load_more_danmaku and is_dandanplay_catalog(server) then
             fetch_danmaku_all(episodeId, from_menu, server)
         else
             fetch_danmaku(episodeId, from_menu, server)
@@ -174,12 +249,13 @@ end
 
 -- 回退使用额外的弹幕获取方式
 function get_danmaku_fallback(query)
-    local url = options.fallback_server .. "/?url=" .. query
+    if options.fallback_server == '' then return end
+    local url = options.fallback_server:gsub("/+$", "") .. "/?ac=dm&url=" .. url_encode(query)
     msg.verbose("尝试获取弹幕(fallback)：" .. url)
     local args = get_base_curl_args()
     table.insert(args, url)
     call_cmd_async(args, function(err, content)
-        async_running = false
+
         if err then
             show_message("HTTP 请求失败，打开控制台查看详情", 5)
             msg.error("Fallback curl error: " .. err)
@@ -189,7 +265,12 @@ function get_danmaku_fallback(query)
             msg.warn("Fallback server returned empty response")
             return
         end
-        save_danmaku_memory(query, content, "user_custom", "xml")
+        local data = normalize_danmaku_response(parse_json_table(content))
+        if data and type(data.comments) == 'table' then
+            save_danmaku_data(data.comments, query, 'user_custom')
+        else
+            save_danmaku_memory(query, content, "user_custom", "xml")
+        end
         load_danmaku(true)
     end)
 end
@@ -226,7 +307,7 @@ function make_danmaku_request_args(method, url, headers, body)
         table.insert(args, 'Content-Type: application/json')
     end
 
-    if url:find("api%.dandanplay%.") then
+    if is_official_dandanplay_server(url) then
         local time = os.time()
         init_credentials()
         table.insert(args, '-H'); table.insert(args, string.format('X-AppId: %s', DANDAN_APPID_DEC))
@@ -545,12 +626,12 @@ function match_file_concurrent(file_path, file_name, callback, specific_servers)
     local servers = specific_servers or get_api_servers()
     local hash = nil
     local file_info = utils.file_info(file_path)
-    local excluded_path = utils.parse_json(options.excluded_path)
+    local excluded_path = parse_json_table(options.excluded_path) or {}
     if PLATFORM == "windows" then
         for i, path in pairs(excluded_path) do excluded_path[i] = path:gsub("/", "\\") end
     end
     local dir = get_parent_directory(file_path)
-    if not is_protocol(file_path) and not contains_any(excluded_path, dir) and file_info and file_info.size >= 16 * 1024 * 1024 then
+    if not is_protocol(file_path) and not contains_any(excluded_path, dir or "") and type(MD5) == "table" and MD5.new and file_info and file_info.size >= 16 * 1024 * 1024 then
         local file, error = io.open(normalize(file_path), 'rb')
         if file and not error then
             local m = MD5.new()
@@ -636,25 +717,30 @@ function match_file_concurrent(file_path, file_name, callback, specific_servers)
 end
 
 -- 异步获取弹幕数据
-function fetch_danmaku_data(args, callback)
+function fetch_danmaku_data(args, callback, quiet)
     call_cmd_async(args, function(error, json)
-        async_running = false
+
         if error then
             msg.info("获取弹幕数据出错，请稍后在选择弹幕源里重试。错误信息: " .. error)
-            show_message("弹幕请求失败，打开控制台查看详情", 5)
+            if not quiet then show_message("弹幕请求失败，打开控制台查看详情", 5) end
+            callback(nil, error)
             return
         end
 
         if not json or json == "" then
              msg.warn("弹幕 HTTP 请求成功返回，但数据内容为空。")
-             show_message("弹幕数据返回为空", 3)
+             if not quiet then show_message("弹幕数据返回为空", 3) end
+             callback(nil, 'empty response')
              return
         end
 
-        local success, data = pcall(utils.parse_json, json)
-        if not success then
+        local success, data = pcall(parse_json_table, json)
+        if success and not data and json:match('^%s*<') then data = {xml = json} end
+        data = normalize_danmaku_response(data)
+        if not success or type(data) ~= 'table' then
             msg.warn("弹幕 JSON 解析失败" )
-            show_message("弹幕数据解析失败", 3)
+            if not quiet then show_message("弹幕数据解析失败", 3) end
+            callback(nil, 'invalid JSON')
             return
         end
 
@@ -667,7 +753,7 @@ function save_danmaku_data(comments, query, danmaku_source)
     -- 转换为 Lua Table
     local danmaku_list = save_danmaku_json(comments)
 
-    if danmaku_list and #danmaku_list > 0 then
+    if danmaku_list then
         if DANMAKU.sources[query] == nil then
             DANMAKU.sources[query] = {from = danmaku_source}
         end
@@ -677,98 +763,41 @@ function save_danmaku_data(comments, query, danmaku_source)
 end
 
 -- 处理弹幕数据
-function handle_danmaku_data(query, data, from_menu)
-    local comments = data["comments"]
-    local count = data["count"]
-
-    if count == 0 then
-        show_message("服务器无缓存数据，再次尝试请求", 30)
-        msg.verbose("服务器无缓存数据，再次尝试请求")
-        local start = os.time()
-        while os.time() - start < 2 do
-            -- 空循环，等待 2 秒
-        end
-        local servers = get_api_servers()
-        local base = servers[1]
-
-        for _, s in ipairs(servers) do
-            if s:find("api%.dandanplay%.") or s:find("/api/v1/") then
-                base = s
-                break
-            end
-        end
-
-        local url = base .. "/api/v2/extcomment?url=" .. url_encode(query)
-        local args = make_danmaku_request_args("GET", url)
-
-        if args == nil then
-            return
-        end
-
-        fetch_danmaku_data(args, function(retry_data)
-            if not retry_data or not retry_data["comments"] or retry_data["count"] == 0 then
-                get_danmaku_fallback(query)
-                return
-            end
-            save_danmaku_data(retry_data["comments"], query, "user_custom")
-            load_danmaku(from_menu)
+function handle_danmaku_data(query, data, from_menu, retried)
+    if type(data) ~= 'table' then get_danmaku_fallback(query); return end
+    local comments = data.comments
+    if type(comments) == 'table' and #comments > 0 then
+        save_danmaku_data(comments, query, 'user_custom')
+        load_danmaku(from_menu)
+    elseif not retried then
+        show_message('服务器暂无缓存，稍后重试', 3)
+        add_playback_timeout(2, function()
+            local url = get_api_servers()[1] .. '/api/v2/extcomment?url=' .. url_encode(query)
+            fetch_danmaku_data(make_danmaku_request_args('GET', url), function(result)
+                handle_danmaku_data(query, result, from_menu, true)
+            end)
         end)
     else
-        save_danmaku_data(comments, query, "user_custom")
-        load_danmaku(from_menu)
+        get_danmaku_fallback(query)
     end
 end
 
--- 处理第三方弹幕数据
 function handle_related_danmaku(index, relateds, related, shift, callback)
-    local servers = get_api_servers()
-    local base = servers[1]
-
-    for _, s in ipairs(servers) do
-        if s:find("api%.dandanplay%.") or s:find("/api/v1/") then
-            base = s
-            break
-        end
-    end
-
-    local url = base .. "/api/v2/extcomment?url=" .. url_encode(related["url"])
-    show_message(string.format("正在从第三方库装填弹幕 [%d/%d]", index, #relateds), 30)
-    msg.verbose("正在从第三方库装填弹幕：" .. url)
-
-    local args = make_danmaku_request_args("GET", url)
-
-    if args == nil then
-        return
-    end
-
-    fetch_danmaku_data(args, function(data)
-        local comments = {}
-        if data and data["comments"] then
-            if data["count"] == 0 then
-                local start = os.time()
-                while os.time() - start < 2 do
-                    -- 空循环
-                end
-                fetch_danmaku_data(args, function(data)
-                    for _, comment in ipairs(data["comments"]) do
-                        comment["shift"] = shift
-                        table.insert(comments, comment)
-                    end
-                    callback(comments)
-                end)
-            else
-                for _, comment in ipairs(data["comments"]) do
-                    comment["shift"] = shift
-                    table.insert(comments, comment)
-                end
-                callback(comments)
+    local base = get_api_servers()[1]
+    local args = make_danmaku_request_args('GET', base .. '/api/v2/extcomment?url=' .. url_encode(related.url))
+    local function request(retried)
+        fetch_danmaku_data(args, function(data)
+            local comments = type(data) == 'table' and data.comments or {}
+            if type(comments) ~= 'table' then comments = {} end
+            if #comments == 0 and not retried then
+                add_playback_timeout(2, function() request(true) end)
+                return
             end
-        else
-            show_message("无数据", 3)
-            msg.info("无数据")
+            for _, comment in ipairs(comments) do comment.shift = shift end
             callback(comments)
-        end
-    end)
+        end)
+    end
+    request(false)
 end
 
 function handle_main_danmaku(url, from_menu)
@@ -799,6 +828,7 @@ function handle_fetched_danmaku(data, url, from_menu)
     else
         show_message("弹幕数据加载不成功，请稍后在选择弹幕源里重试", 3)
         msg.verbose("无数据或格式错误，结束加载url：" .. url)
+        if not from_menu then auto_load_fallback() end
     end
 end
 
@@ -806,7 +836,7 @@ function filter_excluded_platforms(relateds)
     local excluded_list = {}
     local excluded_json = options.excluded_platforms
     if excluded_json and excluded_json ~= "" and excluded_json ~= "[]" then
-        local success, parsed = pcall(utils.parse_json, excluded_json)
+        local success, parsed = pcall(parse_json_table, excluded_json)
         if success and parsed and type(parsed) == "table" then
             excluded_list = parsed
         end
@@ -856,6 +886,14 @@ end
 
 function fetch_danmaku_all(episodeId, from_menu, specific_server)
     local server = specific_server or get_api_servers()[1]
+    -- The upstream proxy exposes combined comments, not /related. Catalog
+    -- search support does not imply support for the separate related API.
+    if not is_official_dandanplay_server(server) then
+        fetch_danmaku(episodeId, from_menu, server)
+        return
+    end
+    local main_url = server .. '/api/v2/comment/' .. episodeId .. '?withRelated=false&chConvert=0'
+    handle_main_danmaku(main_url, from_menu)
     local url = server .. "/api/v2/related/" .. episodeId
     show_message("弹幕加载中...", 30)
     msg.verbose("尝试获取弹幕：" .. url)
@@ -867,16 +905,13 @@ function fetch_danmaku_all(episodeId, from_menu, specific_server)
 
     fetch_danmaku_data(args, function(data)
         if not data or not data["relateds"] then
-            show_message("无数据", 3)
-            msg.info("无数据")
+            msg.verbose('额外来源不可用，保留已请求的主弹幕')
             return
         end
 
         local filtered_relateds = filter_excluded_platforms(data["relateds"])
         local function process_related(index)
             if index > #filtered_relateds then
-                local main_url = server .. "/api/v2/comment/" .. episodeId .. "?withRelated=false&chConvert=0"
-                handle_main_danmaku(main_url, from_menu)
                 return
             end
 
@@ -885,6 +920,7 @@ function fetch_danmaku_all(episodeId, from_menu, specific_server)
             handle_related_danmaku(index, filtered_relateds, related, related["shift"], function(comments)
                 if comments and #comments > 0 then
                     save_danmaku_data(comments, related["url"], "api_server")
+                    load_danmaku(from_menu, true)
                 elseif DANMAKU.sources[related["url"]] == nil then
                     DANMAKU.sources[related["url"]] = {from = "api_server"}
                 end
@@ -894,14 +930,14 @@ function fetch_danmaku_all(episodeId, from_menu, specific_server)
         end
 
         process_related(1)
-    end)
+    end, true)
 end
 
 function addon_danmaku(check_history, from_menu)
     if check_history then
         local key = get_cache_key()
         local history_json = read_file(HISTORY_PATH)
-        local history = utils.parse_json(history_json) or {}
+        local history = parse_json_table(history_json) or {}
         if history[key] and history[key].extra ~= nil then
             return
         end
@@ -914,6 +950,8 @@ function addon_danmaku(check_history, from_menu)
 end
 
 function add_danmaku_source(query, from_menu)
+    if type(query) ~= 'string' or query == '' then return end
+    if from_menu then set_danmaku_visibility(true) end
     if DANMAKU.sources[query] == nil then
         DANMAKU.sources[query] = {from = "user_custom"}
     end
@@ -938,7 +976,7 @@ function add_danmaku_source_local(query, from_menu)
         path = path,
         url = query
     }}
-    local danmaku_list = parse_danmaku_sources(temp_collection, {})
+    local danmaku_list = parse_danmaku_sources(temp_collection, {}, true)
     if danmaku_list and #danmaku_list > 0 then
         if DANMAKU.sources[query] == nil then
             DANMAKU.sources[query] = {from = "user_local"}
@@ -952,7 +990,7 @@ function add_danmaku_source_local(query, from_menu)
     end
 end
 
-function add_danmaku_source_online(query, from_menu)
+function add_danmaku_source_online(query, from_menu, skip_site)
     set_danmaku_button()
     if query:find("/api/v2/comment/") or query:find("/api/v2/related/") then
         show_message("正在加载额外弹幕源...", 30)
@@ -970,10 +1008,13 @@ function add_danmaku_source_online(query, from_menu)
         end)
         return
     end
+    if not skip_site and load_site_danmaku(query, function(success)
+        if not success then add_danmaku_source_online(query, from_menu, true) end
+    end) then return end
     local servers = get_api_servers()
     local base = servers[1]
     for _, s in ipairs(servers) do
-        if s:find("api%.dandanplay%.") or s:find("/api/v1/") then
+        if is_dandanplay_catalog(s) or s:find("/api/v1/") then
             base = s
             break
         end
@@ -999,36 +1040,22 @@ end
 
 -- 将弹幕转换为factory可读的json格式
 function save_danmaku_json(comments)
-    local danmaku_list = {}
-    for _, comment in ipairs(comments) do
-        local p = comment["p"]
-        local shift = comment["shift"]
-        if p then
-            local fields = split(p, ",")
-            if shift ~= nil then
-                fields[1] = tonumber(fields[1]) + tonumber(shift)
+    local result = {}
+    for _, comment in ipairs(type(comments) == 'table' and comments or {}) do
+        if type(comment) == 'table' and type(comment.p) == 'string' and type(comment.m) == 'string' then
+            local fields = split(comment.p, ',')
+            local time, mode = tonumber(fields[1]), tonumber(fields[2])
+            if time and mode then
+                result[#result + 1] = {
+                    time = time + (tonumber(comment.shift) or 0), type = mode,
+                    size = 25, color = tonumber(fields[3]) or 0xFFFFFF,
+                    text = comment.m:gsub('[%z\1-\8\11\12\14-\31]', ''),
+                }
             end
-            local time = tonumber(fields[1])
-            local type = tonumber(fields[2])
-            local color = tonumber(fields[3]) or 0xFFFFFF
-            local size = 25
-            local m_value = comment["m"]
-                            :gsub("[%z\1-\31]", "")
-                            :gsub("\\", "")
-                            :gsub("\"", "")
-
-            table.insert(danmaku_list, {
-                time = time,
-                type = type,
-                size = size,
-                color = color,
-                text = m_value
-            })
         end
     end
-    table.sort(danmaku_list, function(a, b) return a.time < b.time end)
-
-    return danmaku_list
+    table.sort(result, function(a, b) return a.time < b.time end)
+    return result
 end
 
 -- 执行匹配链：处理优先级和 Fallback
@@ -1036,14 +1063,14 @@ local function execute_match_chain(strategy, file_path, file_name, servers)
     local function fallback_to_anime(err_source)
         msg.warn(err_source .. " 失败，尝试 Fallback 到 anime_match")
         match_anime_concurrent(function(err)
-            if err then msg.verbose("所有匹配策略均失败: " .. err) end
+            if err then msg.verbose("所有匹配策略均失败: " .. err); auto_load_fallback() end
         end, servers)
     end
 
     local function fallback_to_file(err_source)
         msg.warn(err_source .. " 失败，尝试 Fallback 到 file_match")
         match_file_concurrent(file_path, file_name, function(err)
-            if err then msg.verbose("所有匹配策略均失败: " .. err) end
+            if err then msg.verbose("所有匹配策略均失败: " .. err); auto_load_fallback() end
         end, servers)
     end
 
@@ -1064,7 +1091,7 @@ function get_danmaku_with_hash(file_name, file_path, specific_servers)
 
     local strategy = "file_first"
     -- 如果首选服务器是 dandanplay，或者没有 MD5 库，则优先搜番剧
-    if (servers[1] and servers[1]:find("api%.dandanplay%.")) or (type(MD5) ~= "table" or not MD5.sum) then
+    if (servers[1] and is_dandanplay_catalog(servers[1])) or (type(MD5) ~= "table" or not MD5.sum) then
         strategy = "anime_first"
     end
     if is_protocol(file_path) and options.hash_for_url then
@@ -1078,9 +1105,9 @@ function get_danmaku_with_hash(file_name, file_path, specific_servers)
         if options.proxy ~= "" then table.insert(arg, "-x"); table.insert(arg, options.proxy) end
 
         call_cmd_async(arg, function(error)
-            async_running = false
+
             -- 下载完成后，执行统一匹配链
-            execute_match_chain(strategy, output_path, file_name, servers)
+            execute_match_chain(strategy, error and file_path or output_path, file_name, servers)
         end)
         return
     end

@@ -1,8 +1,35 @@
 local utils = require 'mp.utils'
 local msg = require 'mp.msg'
+local unpack = unpack or table.unpack
+
+-- Keep sequential pagination readable without blocking mpv's event loop.
+local function await_subprocess(command)
+    local worker = coroutine.running()
+    local args = command.args
+    table.insert(args, 2, '--fail')
+    table.insert(args, 2, tostring(options.request_timeout))
+    table.insert(args, 2, '--max-time')
+    if options.proxy ~= '' then args[#args + 1] = '-x'; args[#args + 1] = options.proxy end
+    call_cmd_async(args, function(err, output)
+        local ok, detail = coroutine.resume(worker, {status = err and 1 or 0, stdout = output or '', stderr = err or ''})
+        if not ok then msg.error(tostring(detail)); show_message('额外源查询失败，请查看控制台', 3) end
+    end)
+    return coroutine.yield()
+end
+
+local function async_task(callback)
+    return function(...)
+        local worker = coroutine.create(callback)
+        local ok, detail = coroutine.resume(worker, ...)
+        if not ok then msg.error(tostring(detail)); show_message('额外源查询失败，请查看控制台', 3) end
+    end
+end
+
+local cached_series_playlinks = {}
 
 local Source = {
     ["b 站"] = "bilibili1",
+    ["芒果TV"] = "imgo",
     ["腾讯"] = "qq",
     ["爱奇艺"] = "qiyi",
     ["优酷"] = "youku",
@@ -12,9 +39,18 @@ local function load_extra_danmaku(url, episode, number, class, id, site, title, 
     local play_url = nil
     if url:match("^.-%.html") then
         play_url = url:match("^(.-%.html).*")
+    elseif url:match("^https?://v%.youku%.com/") and url:match("[?&]vid=") then
+        -- 转换 youku 的短链接形式 video?vid=... 到真实播放页 v_show/id_*.html
+        local vid = url:match("[?&]vid=([^&]+)")
+        if vid then
+            play_url = "https://v.youku.com/v_show/id_" .. vid .. ".html"
+        else
+            play_url = url:gsub("%?bsource=360ogvys$",""):gsub("&.*$","")
+        end
     else
-        play_url = url:gsub("%?bsource=360ogvys$","")
+        play_url = url:gsub("%?bsource=360ogvys$",""):gsub("&.*$","")
     end
+
     ENABLED = true
     DANMAKU.anime = title .. " (" .. year .. ")"
     DANMAKU.episode = "第" .. episode .. "话"
@@ -67,7 +103,7 @@ function query_tmdb(title, class, menu, callback)
             return
         end
 
-        local data = utils.parse_json(json)
+        local data = parse_json_table(json)
         if not data then
             msg.verbose("[TMDB] JSON 解析失败")
             if menu then
@@ -114,12 +150,38 @@ function query_tmdb(title, class, menu, callback)
     end)
 end
 
+
+-- 从单个 seriesPlaylinks 项解析出有效的播放 URL
+local function extract_episode_url(item, playlink)
+    if not item then return nil end
+    if type(item) == 'string' then
+        return playlink or item
+    elseif type(item) == 'table' then
+        return item.url or nil
+    end
+    return nil
+end
+
+-- 将 seriesPlaylinks 转换为统一的 episode_rows 列表：{ index=string, url=string }
+local function build_episode_rows(seriesPlaylinks, playlink)
+    if not seriesPlaylinks or type(seriesPlaylinks) ~= 'table' then return nil end
+    local rows = {}
+    for i, it in ipairs(seriesPlaylinks) do
+        local url = extract_episode_url(it, playlink)
+        if url and url ~= '' then
+            table.insert(rows, { index = tostring(i), url = url })
+        end
+    end
+    if #rows == 0 then return nil end
+    return rows
+end
+
 local function get_number(cat, id, site)
     local url = string.format("https://api.web.360kan.com/v1/detail?cat=%s&id=%s&site=%s",
         cat, id, site)
 
     local cmd = { "curl", "-s", url }
-    local res = mp.command_native({
+    local res = await_subprocess({
         name = "subprocess",
         args = cmd,
         capture_stdout = true,
@@ -131,11 +193,101 @@ local function get_number(cat, id, site)
         return nil
     end
 
-    local result = utils.parse_json(res.stdout)
+    local result = parse_json_table(res.stdout)
     if result and result.data and result.data.allupinfo then
         return tonumber(result.data.allupinfo[site])
     end
     return nil
+end
+
+-- 使用 /v1/detail 分批获取集数（每批最多200集）
+local function get_episodes_v1(cat, id, site, number)
+    if not number or tonumber(number) == 0 then
+        return nil
+    end
+
+    local batch_size = 200
+    local start_idx = 1
+    local episodes = {}
+    while start_idx <= tonumber(number) do
+        local end_idx = math.min(start_idx + batch_size - 1, tonumber(number))
+        local url = string.format("https://api.web.360kan.com/v1/detail?cat=%s&id=%s&start=%s&end=%s&site=%s",
+            cat, id, start_idx, end_idx, site)
+
+        local cmd = { "curl", "-s", url }
+        local res = await_subprocess({
+            name = "subprocess",
+            args = cmd,
+            capture_stdout = true,
+            capture_stderr = true,
+        })
+
+        if not res.status or res.status ~= 0 then
+            msg.error(string.format("Failed to fetch detail batch %d-%d: %s", start_idx, end_idx, res.stderr or "unknown"))
+            if start_idx == 1 then
+                return nil
+            else
+                break
+            end
+        end
+
+        local result = parse_json_table(res.stdout)
+        if result and result.data and result.data.allepidetail and result.data.allepidetail[site] then
+            for _, it in ipairs(result.data.allepidetail[site]) do
+                table.insert(episodes, { index = tostring(it.playlink_num), url = it.url })
+            end
+        end
+
+        start_idx = end_idx + 1
+    end
+
+    if #episodes == 0 then
+        return nil
+    end
+    return episodes
+end
+
+local function get_episodes_v2(cat, id, site)
+    local s_param = string.format('[{"cat_id":"%s","ent_id":"%s","site":"%s"}]', tostring(cat), tostring(id), tostring(site))
+
+    local url = string.format("https://api.so.360kan.com/episodesv2?v_ap=1&s=%s", url_encode(s_param))
+
+    local cmd = { "curl", "-s", url }
+    local res = await_subprocess({
+        name = "subprocess",
+        args = cmd,
+        capture_stdout = true,
+        capture_stderr = true,
+    })
+
+    if not res.status or res.status ~= 0 then
+        msg.warn("Failed to fetch episodesv2: " .. (res.stderr or "unknown error"))
+        return nil
+    end
+
+    local parsed = parse_json_table(res.stdout)
+    if not parsed then
+        msg.warn("episodesv2: 解析返回失败: " .. (res.stdout or ""))
+        return nil
+    end
+
+    local episodes = {}
+    if parsed.code == 0 and parsed.data and #parsed.data > 0 then
+        local seriesHTML = parsed.data[1] and parsed.data[1].seriesHTML
+        if seriesHTML and seriesHTML.seriesPlaylinks then
+            local rows = build_episode_rows(seriesHTML.seriesPlaylinks)
+            if rows then
+                for _, r in ipairs(rows) do
+                    table.insert(episodes, { index = tonumber(r.index), url = r.url })
+                end
+            end
+        end
+    end
+
+    if #episodes == 0 then
+        return nil
+    end
+    return episodes
 end
 
 function get_details(class, id, site, title, year, number, episodenum)
@@ -144,7 +296,7 @@ function get_details(class, id, site, title, year, number, episodenum)
     local menu_title = "剧集信息"
     local footnote = "使用 / 打开筛选"
     if uosc_available and not episodenum then
-        update_menu_uosc(menu_type, menu_title, message, footnote)
+        update_menu_uosc(menu_type, menu_title, message, footnote, nil, nil, "spinner")
     else
         show_message(message, 3)
     end
@@ -160,69 +312,89 @@ function get_details(class, id, site, title, year, number, episodenum)
         cat = 4
     end
 
-    if not number and cat ~= 0 then
-        number = get_number(cat, id, site)
-    end
-    if not number or cat == 0 then
-        local message = "无结果"
-        if uosc_available and not episodenum then
-            update_menu_uosc(menu_type, menu_title, message, footnote)
-        else
-            show_message(message, 3)
-        end
-        msg.verbose("无结果")
-        return
-    end
-
-    local url = string.format("https://api.web.360kan.com/v1/detail?cat=%s&id=%s&start=1&end=%s&site=%s",
-        cat, id, number, site)
-
-    local cmd = { "curl", "-s", url }
-    local res = mp.command_native({
-        name = "subprocess",
-        args = cmd,
-        capture_stdout = true,
-        capture_stderr = true,
-    })
-
-    if not res.status or res.status ~= 0 then
-        local message = "无结果"
-        if uosc_available and not episodenum then
-            update_menu_uosc(menu_type, menu_title, message, footnote)
-        else
-            show_message(message, 3)
-        end
-        msg.verbose("无结果")
-        return
-    end
-
-    local result = utils.parse_json(res.stdout)
     local items = {}
-    if result and result.data and result.data.allepidetail then
-        local data = result.data.allepidetail
-        local playurl, episode = nil, nil
-        if episodenum then
-            for _, item in ipairs(data[site]) do
-                if tonumber(item.playlink_num) == tonumber(episodenum) then
-                    playurl = item.url
-                    episode = item.playlink_num
-                    break
-                end
+    local episodes = nil
+    local episode_rows = nil
+
+    -- 优先尝试使用搜索时缓存的 seriesPlaylinks（若存在且站点匹配）
+    if cat == 2 or cat == 4 then
+        local cid = tostring(id)
+        local cached = cached_series_playlinks[cid]
+        if cached and cached.seriesPlaylinks and cached.seriesSite and tostring(cached.seriesSite) == tostring(site) then
+            local rows = build_episode_rows(cached.seriesPlaylinks, cached.playlink)
+            if rows then
+                episode_rows = rows
             end
-            if playurl then
-                load_extra_danmaku(playurl, episode, number, class, id, site, title, year)
+        end
+    end
+
+    -- 若未命中缓存，则继续使用 episodesv2/v1 的原有流程
+    if not episode_rows then
+        if cat == 2 or cat == 4 then
+            episodes = get_episodes_v2(cat, id, site)
+        end
+
+        -- 统一构建 episode_rows：优先使用 episodesv2 返回的数据，否则使用 v1/detail
+        if episodes then
+            episode_rows = {}
+            for _, ep in ipairs(episodes) do
+                table.insert(episode_rows, { index = tostring(ep.index), url = ep.url })
+            end
+        else
+            if not number and cat ~= 0 then
+                number = get_number(cat, id, site)
+            end
+            if not number or cat == 0 then
+                local message = "无结果"
+                if uosc_available and not episodenum then
+                    update_menu_uosc(menu_type, menu_title, message, footnote)
+                else
+                    show_message(message, 3)
+                end
+                msg.verbose("无结果")
+                return
+            end
+
+            episode_rows = get_episodes_v1(cat, id, site, number)
+            if not episode_rows or #episode_rows == 0 then
+                local message = "无结果"
+                if uosc_available and not episodenum then
+                    update_menu_uosc(menu_type, menu_title, message, footnote)
+                else
+                    show_message(message, 3)
+                end
+                msg.verbose("无结果")
                 return
             end
         end
-        for _, item in ipairs(data[site]) do
+    end
+
+    if episode_rows and #episode_rows > 0 then
+        if episodenum then
+            for _, ep in ipairs(episode_rows) do
+                if tonumber(ep.index) == tonumber(episodenum) then
+                    load_extra_danmaku(ep.url, ep.index, number, class, id, site, title, year)
+                    return
+                end
+            end
+        end
+
+        table.insert(items, {
+            title = "↩️ 返回搜索结果",
+            value = { "script-message-to", "uosc", "open-menu", latest_menu_anime },
+            keep_open = false,
+            selectable = true,
+        })
+
+        for _, ep in ipairs(episode_rows) do
             table.insert(items, {
-                title = "第" .. item.playlink_num .. "集",
-                hint = item.playlink_num,
+                title = "第" .. ep.index .. "集",
+                hint = ep.index,
                 value = {
                     "script-message-to",
                     mp.get_script_name(),
                     "add-extra-event",
-                    item.url, item.playlink_num, number, class, id, site, title, year
+                    ep.url, ep.index, tostring(number), class, id, site, title, year
                 },
             })
         end
@@ -232,7 +404,7 @@ function get_details(class, id, site, title, year, number, episodenum)
             update_menu_uosc(menu_type, menu_title, items, footnote)
         elseif not episodenum then
             show_message("", 0)
-            mp.add_timeout(0.1, function()
+            add_playback_timeout(0.1, function()
                 open_menu_select(items)
             end)
         end
@@ -254,7 +426,7 @@ local function search_query(query, class, menu)
     end
     local cmd = { "curl", "-s", url }
 
-    local res = mp.command_native({
+    local res = await_subprocess({
         name = "subprocess",
         args = cmd,
         capture_stdout = true,
@@ -272,11 +444,23 @@ local function search_query(query, class, menu)
         return
     end
 
-    local result = utils.parse_json(res.stdout)
+    local result = parse_json_table(res.stdout)
     local items = {}
-    if result and result.data.longData and result.data.longData.rows then
+    if result and result.data and result.data.longData and result.data.longData.rows then
         for _, item in ipairs(result.data.longData.rows) do
             if item.playlinks then
+                -- 如果搜索结果中包含 seriesPlaylinks，则缓存它（使用 en_id 作为 key）
+                if item.seriesPlaylinks and item.en_id then
+                    local playlink = nil
+                    if item.playlinks and item.seriesSite then
+                        playlink = item.playlinks[item.seriesSite]
+                    end
+                    cached_series_playlinks[tostring(item.en_id)] = {
+                        seriesPlaylinks = item.seriesPlaylinks,
+                        seriesSite = item.seriesSite,
+                        playlink = playlink,
+                    }
+                end
                 for source_name, source_id in pairs(Source) do
                     if item.playlinks[source_id] then
                         table.insert(items, {
@@ -297,10 +481,10 @@ local function search_query(query, class, menu)
     end
     if #items > 0 then
         if uosc_available then
-            update_menu_uosc(menu.type, menu.title, items, menu.footnote, menu.cmd, query)
+            latest_menu_anime = update_menu_uosc(menu.type, menu.title, items, menu.footnote, menu.cmd, query)
         else
             show_message("", 0)
-            mp.add_timeout(0.1, function()
+            add_playback_timeout(0.1, function()
                 open_menu_select(items)
             end)
         end
@@ -327,7 +511,7 @@ function query_extra(name, class)
     }
     menu.cmd = { "script-message-to", mp.get_script_name(), "search-anime-event" }
     if uosc_available then
-        update_menu_uosc(menu.type, menu.title, message, menu.footnote, menu.cmd, name)
+        update_menu_uosc(menu.type, menu.title, message, menu.footnote, menu.cmd, name, "spinner")
     else
         show_message(message, 30)
     end
@@ -348,16 +532,13 @@ function query_extra(name, class)
         return
     end
 
-    local tmdb_class = "tv"
-    if class == "dy" then
-        tmdb_class = "movie"
-    end
-
-    query_tmdb(name, tmdb_class, menu, function(title)
-        local search_query = title or name
-        get_animes(search_query)
+    query_tmdb(name, class == 'dy' and 'movie' or 'tv', menu, function(title)
+        async_task(function() search_query(title or name, class, menu) end)()
     end)
 end
+
+get_details = async_task(get_details)
+query_extra = async_task(query_extra)
 
 mp.register_script_message("get-extra-event", function(cat, id, playlink, source_id, title, year)
     if uosc_available then

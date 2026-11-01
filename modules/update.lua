@@ -2,10 +2,20 @@ local msg = require('mp.msg')
 local utils = require("mp.utils")
 
 local repo = "Loukyuu1120/uosc_danmaku"
-local zip_file = utils.join_path(os.getenv("TEMP") or "/tmp/", "uosc_danmaku.zip")
+local zip_file = utils.join_path(os.getenv("TEMP") or "/tmp/", "uosc_danmaku-" .. tostring(utils.getpid()) .. ".zip")
 
 local local_version = VERSION or "0.0.0"
 local platform = mp.get_property("platform")
+local updating = false
+
+local function await_update_command(command)
+    local worker = coroutine.running()
+    call_cmd_async(command.args, function(err, output)
+        local ok, detail = coroutine.resume(worker, {status = err and 1 or 0, stdout = output or '', stderr = err or ''})
+        if not ok then updating = false; msg.error(tostring(detail)); show_message('更新失败，查看控制台', 3) end
+    end, {playback_only = false})
+    return coroutine.yield()
+end
 
 local function version_greater(v1, v2)
     local function parse(ver)
@@ -21,8 +31,8 @@ end
 
 local function get_latest_release(repo)
     local url = "https://api.github.com/repos/" .. repo .. "/releases/latest"
-    local cmd = { "curl", "-sL", url }
-    local res = mp.command_native({
+    local cmd = { "curl", "--fail", "--connect-timeout", "10", "--max-time", "30", "-sL", url }
+    local res = await_update_command({
         name = "subprocess",
         args = cmd,
         capture_stdout = true,
@@ -39,89 +49,73 @@ local function escape_ps(str)
     return tostring(str):gsub("'", "''")
 end
 
-local function unzip_overwrite(zip_file)
+local function unzip_overwrite(archive)
     local outpath = mp.get_script_directory()
-    -- 定义临时目录路径，用于安全更新
-    local tmpdir = utils.join_path(
-        (platform == "windows" and (os.getenv("TEMP") or "C:\\Windows\\Temp") or "/tmp"),
-        "uosc_update_" .. tostring(os.time())
-    )
-    
-    local cmd_unzip = {}
-
-    msg.info("创建临时目录并解压: " .. tmpdir)
-
-    if platform == "windows" then
-        -- PowerShell: Expand-Archive (会自动创建目标目录)
-        local ps_script = string.format(
-            "Expand-Archive -LiteralPath '%s' -DestinationPath '%s' -Force",
-            escape_ps(zip_file),
-            escape_ps(tmpdir)
-        )
-        cmd_unzip = { "powershell", "-NoProfile", "-Command", ps_script }
+    local backup = outpath .. '.backup-' .. tostring(utils.getpid()) .. '-' .. tostring(os.time())
+    local staging = backup .. '-staging'
+    local script, args
+    if platform == 'windows' then
+        script = string.format([[
+$ErrorActionPreference = 'Stop'
+$target = [IO.Path]::GetFullPath('%s')
+$backup = [IO.Path]::GetFullPath('%s')
+$stage = [IO.Path]::GetFullPath('%s')
+if ((Split-Path -Parent $target) -ne (Split-Path -Parent $stage)) { throw 'Invalid staging path' }
+if ((Test-Path -LiteralPath $backup) -or (Test-Path -LiteralPath $stage)) { throw 'Update path already exists' }
+Expand-Archive -LiteralPath '%s' -DestinationPath $stage
+if (-not (Test-Path -LiteralPath (Join-Path $stage 'main.lua'))) {
+    $children = @(Get-ChildItem -LiteralPath $stage -Directory)
+    if ($children.Count -ne 1) { throw 'Invalid update layout' }
+    $stage = $children[0].FullName
+}
+foreach ($required in @('main.lua','modules/options.lua','modules/render.lua','apis/dandanplay.lua')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $stage $required) -PathType Leaf)) { throw 'Incomplete update archive' }
+}
+Move-Item -LiteralPath $target -Destination $backup
+try { Move-Item -LiteralPath $stage -Destination $target }
+catch {
+    if (-not (Test-Path -LiteralPath $target)) { Move-Item -LiteralPath $backup -Destination $target }
+    throw
+}
+]], escape_ps(outpath), escape_ps(backup), escape_ps(staging), escape_ps(archive))
+        args = {'powershell', '-NoProfile', '-NonInteractive', '-Command', script}
     else
-        -- Unix: unzip
-        cmd_unzip = { "unzip", "-o", zip_file, "-d", tmpdir }
+        script = [[
+set -eu
+target=$1
+backup=$2
+stage=$3
+archive=$4
+[ ! -e "$backup" ] && [ ! -e "$stage" ]
+mkdir "$stage"
+unzip -q "$archive" -d "$stage"
+if [ ! -f "$stage/main.lua" ]; then
+    set -- "$stage"/*
+    [ "$#" -eq 1 ] && [ -d "$1" ]
+    stage=$1
+fi
+for required in main.lua modules/options.lua modules/render.lua apis/dandanplay.lua; do
+    [ -f "$stage/$required" ]
+done
+mv "$target" "$backup"
+if ! mv "$stage" "$target"; then
+    mv "$backup" "$target"
+    exit 1
+fi
+]]
+        args = {'sh', '-c', script, 'uosc-update', outpath, backup, staging, archive}
     end
-
-    local res = mp.command_native({
-        name = "subprocess",
-        args = cmd_unzip,
-        capture_stdout = true,
-        capture_stderr = true,
-        playback_only = false,
-    })
-
-    if not res or res.status ~= 0 then
-        msg.error("❌ 解压失败:\n" .. (res and (res.stdout .. res.stderr) or "未知错误"))
-        -- 清理残留的临时目录
-        if platform == "windows" then
-            mp.command_native({
-                name = "subprocess",
-                args = {"powershell", "-NoProfile", "-Command", "Remove-Item -LiteralPath '"..escape_ps(tmpdir).."' -Recurse -Force"}
-            })
-        else
-            os.execute("rm -rf \"" .. tmpdir .. "\"")
-        end
+    local result = await_update_command({name = 'subprocess', args = args,
+        capture_stdout = true, capture_stderr = true, playback_only = false})
+    if not result or result.status ~= 0 then
+        msg.error('更新失败，原目录或备份已保留：' .. backup .. ' ' .. (result and result.stderr or ''))
         return false
     end
-
-    msg.info("解压成功，准备替换旧目录...")
-
-    local cmd_swap = {}
-    
-    if platform == "windows" then
-        -- Windows: 在一个 PowerShell 实例中执行删除和移动
-        local ps_swap = string.format(
-            "Remove-Item -LiteralPath '%s' -Recurse -Force -ErrorAction SilentlyContinue; Move-Item -LiteralPath '%s' -Destination '%s' -Force",
-            escape_ps(outpath),
-            escape_ps(tmpdir),
-            escape_ps(outpath)
-        )
-        cmd_swap = { "powershell", "-NoProfile", "-Command", ps_swap }
-    else
-        -- Unix: rm && mv
-        cmd_swap = { "sh", "-c", string.format("rm -rf \"%s\" && mv \"%s\" \"%s\"", outpath, tmpdir, outpath) }
-    end
-
-    local res_swap = mp.command_native({
-        name = "subprocess",
-        args = cmd_swap,
-        capture_stdout = true,
-        capture_stderr = true,
-        playback_only = false,
-    })
-
-    if not res_swap or res_swap.status ~= 0 then
-        msg.error("❌ 替换目录失败:\n" .. (res_swap and (res_swap.stdout .. res_swap.stderr) or ""))
-        return false
-    end
-
-    msg.info("更新完成")
+    msg.info('更新完成，原版本备份：' .. backup)
     return true
 end
 
-function check_for_update()
+local function perform_update()
     msg.info("正在检查更新...")
     local latest_version, download_url = get_latest_release(repo)
     if not latest_version or not download_url then
@@ -139,8 +133,8 @@ function check_for_update()
     show_message("⬇️ 发现新版本: " .. latest_version .. "，正在下载...")
     msg.info("⬇️ 发现新版本: " .. latest_version .. "，地址: " .. download_url)
 
-    local cmd = { "curl", "-L", "-o", zip_file, download_url }
-    local res = mp.command_native({
+    local cmd = { "curl", "--fail", "--connect-timeout", "10", "--max-time", "120", "-L", "-o", zip_file, download_url }
+    local res = await_update_command({
         name = "subprocess",
         args = cmd,
         capture_stdout = true,
@@ -165,4 +159,12 @@ function check_for_update()
         show_message("❌ 解压失败！请查看控制台日志")
         msg.warn("❌ 解压失败！")
     end
+end
+
+function check_for_update()
+    if updating then show_message('更新正在进行中', 2); return end
+    updating = true
+    local worker = coroutine.create(function() perform_update(); updating = false end)
+    local ok, detail = coroutine.resume(worker)
+    if not ok then updating = false; msg.error(tostring(detail)) end
 end
